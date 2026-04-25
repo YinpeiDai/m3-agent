@@ -32,19 +32,37 @@ logging.getLogger("httpcore").setLevel(logging.CRITICAL)
 processing_config = json.load(open("configs/processing_config.json"))
 temp = processing_config["temperature"]
 
-try:
-    config = json.load(open("configs/api_config.json"))
-    client = {}
-    for model_name in config.keys():
+config = json.load(open("configs/api_config.json"))
+client = {}
+for model_name, model_config in config.items():
+    api_key = model_config.get("api_key")
+    if not api_key:
+        logger.warning(f"Skipping API client for {model_name}: missing api_key")
+        continue
+
+    if model_config.get("azure_endpoint"):
         client[model_name] = openai.AzureOpenAI(
-            azure_endpoint=config[model_name]["azure_endpoint"],
-            api_version=config[model_name]["api_version"],
-            api_key=config[model_name]["api_key"],
+            azure_endpoint=model_config["azure_endpoint"],
+            api_version=model_config["api_version"],
+            api_key=api_key,
         )
-except:
-    pass
+    else:
+        base_url = model_config.get("base_url")
+        if not base_url and model_name.startswith("gemini-"):
+            base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+
+        client[model_name] = openai.OpenAI(
+            **client_kwargs,
+        )
 
 MAX_RETRIES = 5
+
+def resolve_model_name(model):
+    return config.get(model, {}).get("model", model)
 
 def get_response(model, messages, timeout=30):
     """Get chat completion response from specified model.
@@ -57,7 +75,7 @@ def get_response(model, messages, timeout=30):
         tuple: (response content, total tokens used)
     """
     response = client[model].chat.completions.create(
-        model=model, messages=messages, temperature=temp, timeout=timeout, max_tokens=8192
+        model=resolve_model_name(model), messages=messages, temperature=temp, timeout=timeout, max_tokens=8192
     )
     
     # return answer and number of tokens
@@ -125,7 +143,7 @@ def get_embedding(model, text, timeout=15):
     Returns:
         tuple: (embedding vector, total tokens used)
     """
-    response = client[model].embeddings.create(input=text, model=model, timeout=timeout)
+    response = client[model].embeddings.create(input=text, model=resolve_model_name(model), timeout=timeout)
     return response.data[0].embedding, response.usage.total_tokens
 
 
@@ -193,7 +211,7 @@ def get_whisper(model, file_path):
         str: Transcription text
     """
     file = open(file_path, "rb")
-    return client[model].audio.transcriptions.create(model=model, file=file).text
+    return client[model].audio.transcriptions.create(model=resolve_model_name(model), file=file).text
 
 def get_whisper_with_retry(model, file_path):
     """Retry Whisper transcription with error handling.

@@ -138,7 +138,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     dataset_name = args.data_file.split("/")[-1].split(".")[0]
     output_path = os.path.join("data/results", f"{dataset_name}.jsonl")
-    model = LLM(model=model_name, tensor_parallel_size=2)
+    model = LLM(model=model_name, tensor_parallel_size=2, dtype="bfloat16", gpu_memory_utilization=0.95)
 
     batched_datas, data = [], []
     datas = json.load(open(args.data_file))

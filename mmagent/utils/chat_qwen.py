@@ -50,7 +50,7 @@ def get_response(messages):
     
     USE_AUDIO_IN_VIDEO = True
     audios, images, videos = process_mm_info(messages, use_audio_in_video=USE_AUDIO_IN_VIDEO)
-    inputs = processor(text=text, audios=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=USE_AUDIO_IN_VIDEO)
+    inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=USE_AUDIO_IN_VIDEO)
     inputs = inputs.to(thinker.device).to(thinker.dtype)
 
     # Inference: Generation of the output text and audio
