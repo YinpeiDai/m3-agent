@@ -26,12 +26,13 @@ from transformers import AutoTokenizer
 from mmagent.utils.general import load_video_graph
 from mmagent.utils.chat_api import generate_messages
 from mmagent.prompts import prompt_agent_verify_answer_referencing
+from tqdm import tqdm
 
 sys.modules["videograph"] = mmagent.videograph
 processing_config = json.load(open("configs/processing_config.json"))
 model_name = "models/M3-Agent-Control"
 config = json.load(open("configs/api_config.json"))
-gpt_model = "gpt-4o-2024-11-20"
+gpt_model = "gpt-4-0125-preview"
 client = openai.AzureOpenAI(
     azure_endpoint=config[gpt_model]["azure_endpoint"],
     api_version=config[gpt_model]["api_version"],
@@ -159,7 +160,7 @@ if __name__ == "__main__":
         batched_datas.append(data)
 
     result = []
-    for batched_data in batched_datas:
+    for batched_data in tqdm(batched_datas[:3]):
         for i in range(len(batched_data)):
             batched_data[i]["conversations"] = [{"role": "system", "content": system_prompt.format(question=batched_data[i]["question"])}, {"role": "user", "content": "Searched knowledge: {}"}]
             batched_data[i]["finish"] = False
