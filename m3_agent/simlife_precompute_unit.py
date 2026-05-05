@@ -81,9 +81,24 @@ def _generate_memory_for_clip(clip_path, faces_json, voice_entries):
     return generate_memories(base64_frames, id2faces, id2voices, clip_path)
 
 
+def _list_existing_clips(clip_dir):
+    """Return ``data/clips/<unit>/{0,1,2,...}.mp4`` sorted by integer name."""
+    if not os.path.isdir(clip_dir):
+        return []
+    paths = []
+    for f in os.listdir(clip_dir):
+        if not f.endswith(".mp4"):
+            continue
+        stem = f[:-4]
+        if stem.isdigit():
+            paths.append(os.path.join(clip_dir, f))
+    return sorted(paths, key=lambda p: int(os.path.basename(p)[:-4]))
+
+
 def precompute_unit(unit_id, src_root="SimLife-Data-HF/video_units",
                     clips_root="data/clips", inter_root="data/intermediate",
-                    skip_memory=False, skip_voice=False, skip_face=False):
+                    skip_memory=False, skip_voice=False, skip_face=False,
+                    skip_clip=False):
     src_dir = os.path.join(src_root, unit_id)
     clip_dir = os.path.join(clips_root, unit_id)
     inter_dir = os.path.join(inter_root, unit_id)
@@ -93,8 +108,18 @@ def precompute_unit(unit_id, src_root="SimLife-Data-HF/video_units",
     if not os.path.exists(video_path):
         raise FileNotFoundError(video_path)
 
-    # A1
-    clips = cut_clips(video_path, clip_dir)
+    # A1 — cut clips (or trust the existing set when --skip_clip).
+    if skip_clip:
+        clips = _list_existing_clips(clip_dir)
+        if not clips:
+            raise FileNotFoundError(
+                f"--skip_clip set but no <K>.mp4 clips under {clip_dir}; "
+                f"run without --skip_clip first to generate them."
+            )
+        logger.info("[%s] skip_clip: reusing %d existing clips at %s",
+                    unit_id, len(clips), clip_dir)
+    else:
+        clips = cut_clips(video_path, clip_dir)
     n_clips = len(clips)
     logger.info("[%s] %d clips at %s", unit_id, n_clips, clip_dir)
 
@@ -178,6 +203,9 @@ def main():
     parser.add_argument("--src_root", default="SimLife-Data-HF/video_units")
     parser.add_argument("--clips_root", default="data/clips")
     parser.add_argument("--inter_root", default="data/intermediate")
+    parser.add_argument("--skip_clip", action="store_true",
+                        help="Reuse existing <out>/<K>.mp4 clips instead of "
+                             "re-cutting (the source video.mp4 is not even read).")
     parser.add_argument("--skip_face", action="store_true")
     parser.add_argument("--skip_voice", action="store_true")
     parser.add_argument("--skip_memory", action="store_true")
@@ -192,6 +220,7 @@ def main():
         src_root=args.src_root,
         clips_root=args.clips_root,
         inter_root=args.inter_root,
+        skip_clip=args.skip_clip,
         skip_face=args.skip_face,
         skip_voice=args.skip_voice,
         skip_memory=args.skip_memory,
