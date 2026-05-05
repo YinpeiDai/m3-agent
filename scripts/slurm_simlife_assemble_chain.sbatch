@@ -11,7 +11,7 @@
 # One job per unique video_chain_id. Array length must match
 # `wc -l data/simlife/data_chains.jsonl` (default 0-49 for the current 50 chains).
 
-set -euo pipefail
+set -eo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 CHAINS_FILE=data/simlife/data_chains.jsonl

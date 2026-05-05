@@ -21,7 +21,7 @@
 #     the 12 h limit.
 #   - For a quicker run, raise NUM_SHARDS to 16 or 25 (one chain per shard).
 
-set -euo pipefail
+set -eo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 NUM_SHARDS="${NUM_SHARDS:-8}"

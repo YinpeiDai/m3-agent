@@ -16,9 +16,9 @@
 # Set --partition / --account / --qos for your cluster before submitting.
 # Array length must match `wc -l data/simlife/units.txt` (default 0-319).
 
-set -euo pipefail
+set -eo pipefail
 
-source /home/daiyp/.bashrc 
+source /home/daiyp/.bashrc
 cd /home/daiyp/m3-agent
 
 UNITS_FILE=data/simlife/units.txt

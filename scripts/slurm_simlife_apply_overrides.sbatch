@@ -22,7 +22,7 @@
 # Tune --array to ``ls SimLife-Data-HF/task_dialogue_audio | wc -l`` (default
 # 0-69 for the current 70 chains).
 
-set -euo pipefail
+set -eo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 REGENERATE_MEMORIES="${REGENERATE_MEMORIES:-1}"
