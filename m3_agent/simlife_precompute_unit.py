@@ -197,7 +197,8 @@ def main():
         skip_memory=args.skip_memory,
     )
     
-    print(f"Precomputation for unit {args.unit} completed in {time.time() - tstart:.2f} seconds.")
+    tend = time.time()
+    print(f"Precomputation for unit {args.unit} completed in {tend - tstart:.2f} seconds.")
 
 
 if __name__ == "__main__":
