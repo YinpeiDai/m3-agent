@@ -136,14 +136,53 @@ def consumer(data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_file", type=str, default="data/annotations/robot.json")
+    # Sharding: split unique mem_paths across N shards by deterministic
+    # index-modulo, so all questions touching the same chain pickle stay
+    # together (preserves disk/OS-cache locality and lets each shard use a
+    # smaller per-process graph cache).
+    parser.add_argument("--num_shards", type=int, default=1,
+                        help="Total number of parallel eval shards.")
+    parser.add_argument("--shard", type=int, default=0,
+                        help="Which shard this process owns, in [0, num_shards).")
+    parser.add_argument("--output_path", type=str, default=None,
+                        help="Override results path. Defaults to "
+                             "data/results/<dataset>.jsonl, or "
+                             "data/results/<dataset>.shard<S>of<N>.jsonl when sharded.")
+    parser.add_argument("--tensor_parallel_size", type=int, default=2,
+                        help="vLLM tensor-parallel size. Set to 1 if your job has only 1 GPU.")
     args = parser.parse_args()
+
+    if args.num_shards < 1 or not (0 <= args.shard < args.num_shards):
+        raise SystemExit(f"Bad shard config: shard={args.shard} num_shards={args.num_shards}")
+
     dataset_name = args.data_file.split("/")[-1].split(".")[0]
-    output_path = os.path.join("data/results", f"{dataset_name}.jsonl")
-    model = LLM(model=model_name, tensor_parallel_size=2, dtype="bfloat16", gpu_memory_utilization=0.95)
+    if args.output_path:
+        output_path = args.output_path
+    elif args.num_shards > 1:
+        output_path = os.path.join(
+            "data/results",
+            f"{dataset_name}.shard{args.shard:03d}of{args.num_shards:03d}.jsonl",
+        )
+    else:
+        output_path = os.path.join("data/results", f"{dataset_name}.jsonl")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    model = LLM(model=model_name, tensor_parallel_size=args.tensor_parallel_size,
+                dtype="bfloat16", gpu_memory_utilization=0.95)
+
+    datas = json.load(open(args.data_file))
+
+    # Stable mem_path → shard mapping (sorted so order doesn't depend on dict).
+    all_mem_paths = sorted({v["mem_path"] for v in datas.values()})
+    my_mem_paths = {p for i, p in enumerate(all_mem_paths)
+                    if i % args.num_shards == args.shard}
+    print(f"shard {args.shard}/{args.num_shards}: "
+          f"{len(my_mem_paths)}/{len(all_mem_paths)} chains -> {output_path}")
 
     batched_datas, data = [], []
-    datas = json.load(open(args.data_file))
     for _, v in datas.items():
+        if v["mem_path"] not in my_mem_paths:
+            continue
         for qa in v["qa_list"]:
             data.append({
                 "id": qa["question_id"],
@@ -158,9 +197,10 @@ if __name__ == "__main__":
                 data = []
     if len(data) > 0:
         batched_datas.append(data)
+    print(f"shard {args.shard}: {sum(len(b) for b in batched_datas)} questions in {len(batched_datas)} batches")
 
     result = []
-    for batched_data in tqdm(batched_datas[:3]):
+    for batched_data in tqdm(batched_datas):
         for i in range(len(batched_data)):
             batched_data[i]["conversations"] = [{"role": "system", "content": system_prompt.format(question=batched_data[i]["question"])}, {"role": "user", "content": "Searched knowledge: {}"}]
             batched_data[i]["finish"] = False

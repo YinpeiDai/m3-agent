@@ -96,8 +96,8 @@ def generate_video_context(
         for j in range(i + 1, len(axes)):
             axes[j].axis("off")
 
-        plt.tight_layout()
-        plt.show()
+        # plt.tight_layout()
+        # plt.show()
 
     voices_input = {}
     for id, voices in voices_list.items():

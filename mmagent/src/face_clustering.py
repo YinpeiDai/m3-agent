@@ -11,8 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import os
+
 import numpy as np
 import hdbscan
+
+_PROC_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "configs", "processing_config.json")
+try:
+    _proc_config = json.load(open(_PROC_CONFIG_PATH))
+except Exception:
+    _proc_config = {}
+
 
 def cluster_faces(faces, min_cluster_size=2, distance_threshold=0.5):
     face_embeddings = []
@@ -30,8 +40,8 @@ def cluster_faces(faces, min_cluster_size=2, distance_threshold=0.5):
 
     face_embeddings = np.array(face_embeddings)
 
-    detection_threshold = 0.8
-    quality_threshold = 20
+    detection_threshold = _proc_config.get("face_cluster_detection_threshold", 0.8)
+    quality_threshold = _proc_config.get("face_cluster_quality_threshold", 20)
     good_mask = [(face_detection_scores[i] >= detection_threshold and face_quality_scores[i] >= quality_threshold) for i in range(len(face_types))]
     bad_mask = [(face_detection_scores[i] < detection_threshold or face_quality_scores[i] < quality_threshold) for i in range(len(face_types))]
 

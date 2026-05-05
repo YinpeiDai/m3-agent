@@ -40,9 +40,175 @@ def get_face(frames):
     faces = [Face(frame_id=f['frame_id'], bounding_box=f['bounding_box'], face_emb=f['face_emb'], cluster_id=f['cluster_id'], extra_data=f['extra_data']) for f in extracted_faces]
     return faces
 
+
+def filter_score_based(face):
+    """Keep faces above the configured detection/quality thresholds."""
+    dthresh = processing_config["face_detection_score_threshold"]
+    qthresh = processing_config["face_quality_score_threshold"]
+    return (
+        float(face["extra_data"]["face_detection_score"]) > dthresh
+        and float(face["extra_data"]["face_quality_score"]) > qthresh
+    )
+
+
+def recluster_unit_faces(intermediate_dir, min_cluster_size=None,
+                         distance_threshold=0.5):
+    """Re-cluster face detections across all clips of one unit.
+
+    Per-clip HDBSCAN is data-starved: 30 s clips often hold fewer than
+    ``face_min_cluster_size`` "good" faces, so most detections end up
+    labeled -1 (noise) and never make it into the graph. Running a single
+    HDBSCAN over the union of every ``clip_*_faces.json`` in this unit
+    gives clustering enough density to find characters, then we write the
+    unit-wide ``cluster_id`` back into each per-clip JSON.
+
+    Each face's stored ``cluster_id`` becomes a *unit-level* identifier:
+    all detections of the same character across all clips share one id.
+    Stage B's cross-clip cosine matching still merges identities across
+    *units* but no longer has to compensate for per-clip noise within a
+    unit.
+
+    The ``cluster_id`` previously written by ``process_faces`` (a per-clip
+    label) is preserved as ``cluster_id_per_clip`` for debugging.
+
+    Args:
+        intermediate_dir: ``data/intermediate/<unit_id>/``.
+        min_cluster_size: HDBSCAN ``min_cluster_size``. Defaults to
+            ``processing_config["face_min_cluster_size"]``.
+        distance_threshold: cosine-similarity threshold; HDBSCAN ``eps``
+            becomes ``1 - distance_threshold``.
+
+    Returns:
+        ``{cluster_id: count}`` dict — total clusters formed and the
+        number of faces per cluster (key ``-1`` is noise).
+    """
+    import glob
+    from collections import Counter
+
+    if min_cluster_size is None:
+        min_cluster_size = processing_config.get("face_min_cluster_size", 3)
+
+    paths = sorted(
+        glob.glob(os.path.join(intermediate_dir, "clip_*_faces.json")),
+        key=lambda p: int(os.path.basename(p).split("_")[1]),
+    )
+
+    # Flatten with provenance so we can split back per-clip after clustering.
+    pool = []   # list of (clip_idx_in_paths, face_idx_in_clip, face_dict)
+    for ci, p in enumerate(paths):
+        for fi, f in enumerate(json.load(open(p))):
+            if filter_score_based(f):
+                pool.append((ci, fi, f))
+
+    if not pool:
+        logger.warning("[%s] no faces pass filter; nothing to recluster",
+                       intermediate_dir)
+        return {}
+
+    pool_faces = [t[2] for t in pool]
+    relabeled = cluster_faces(
+        pool_faces,
+        min_cluster_size=min_cluster_size,
+        distance_threshold=distance_threshold,
+    )
+    new_label = {(t[0], t[1]): rf["cluster_id"]
+                 for t, rf in zip(pool, relabeled)}
+
+    # Rewrite each per-clip JSON. Faces in the pool get the unit-level id;
+    # faces that didn't pass the score filter (and so weren't reclustered)
+    # are forced to -1 so they're treated as noise everywhere — without
+    # this, stale per-clip ids would collide with the new unit-level ones.
+    summary = Counter()
+    for ci, p in enumerate(paths):
+        faces = json.load(open(p))
+        for fi, f in enumerate(faces):
+            old = f.get("cluster_id", -1)
+            f["cluster_id_per_clip"] = old
+            new = new_label.get((ci, fi), -1)
+            f["cluster_id"] = int(new)
+            summary[int(new)] += 1
+        with open(p, "w") as out:
+            json.dump(faces, out)
+
+    return dict(summary)
+
+
+def establish_mapping(faces, key="cluster_id", filter=None):
+    """Group face dicts by a key (default cluster_id), keeping the top-K best per group.
+
+    K is configs/processing_config.json:max_faces_per_character. Used both at
+    detection time (graph-aware update) and at stage-B graph assembly to recover
+    cluster_id -> graph node id mappings without re-running detection.
+    """
+    mapping = {}
+    for face in faces:
+        if key not in face.keys():
+            raise ValueError(f"key {key} not found in faces")
+        if filter and not filter(face):
+            continue
+        id = face[key]
+        if id not in mapping:
+            mapping[id] = []
+        mapping[id].append(face)
+    max_faces = processing_config["max_faces_per_character"]
+    for id in mapping:
+        mapping[id] = sorted(
+            mapping[id],
+            key=lambda x: (
+                float(x["extra_data"]["face_detection_score"]),
+                float(x["extra_data"]["face_quality_score"]),
+            ),
+            reverse=True,
+        )[:max_faces]
+    return mapping
+
+
+def add_face_clusters_to_graph(video_graph, tempid2faces):
+    """Match each per-clip face cluster against existing img nodes and either
+    extend (update_node) or create a new node. Returns:
+
+    - id2faces:        {graph_node_id: [face, ...]} (for downstream Qwen context)
+    - cluster_to_node: {cluster_id: graph_node_id} (the local->global label map
+                        Stage B uses to rewrite memory text — captured BEFORE
+                        the per-node top-K cap that ``id2faces`` applies, so no
+                        cluster_id is lost when several clusters merge).
+    """
+    id2faces = {}
+    cluster_to_node = {}
+    for tempid, faces in tempid2faces.items():
+        if tempid == -1 or not faces:
+            continue
+        face_info = {
+            "embeddings": [face["face_emb"] for face in faces],
+            "contents": [face["extra_data"]["face_base64"] for face in faces],
+        }
+        matched_nodes = video_graph.search_img_nodes(face_info)
+        if matched_nodes:
+            matched_node = matched_nodes[0][0]
+            video_graph.update_node(matched_node, face_info)
+        else:
+            matched_node = video_graph.add_img_node(face_info)
+        for face in faces:
+            face["matched_node"] = matched_node
+        cluster_to_node[int(tempid)] = int(matched_node)
+        id2faces.setdefault(matched_node, []).extend(faces)
+
+    max_faces = processing_config["max_faces_per_character"]
+    for nid, faces in id2faces.items():
+        id2faces[nid] = sorted(
+            faces,
+            key=lambda x: (
+                float(x["extra_data"]["face_detection_score"]),
+                float(x["extra_data"]["face_quality_score"]),
+            ),
+            reverse=True,
+        )[:max_faces]
+    return id2faces, cluster_to_node
+
 def cluster_face(faces):
     faces_json = [{'frame_id': f.frame_id, 'bounding_box': f.bounding_box, 'face_emb': f.face_emb, 'cluster_id': f.cluster_id, 'extra_data': f.extra_data} for f in faces]
-    clustered_faces = cluster_faces(faces_json, 20, 0.5)
+    min_cluster_size = processing_config.get("face_min_cluster_size", 20)
+    clustered_faces = cluster_faces(faces_json, min_cluster_size, 0.5)
     faces = [Face(frame_id=f['frame_id'], bounding_box=f['bounding_box'], face_emb=f['face_emb'], cluster_id=f['cluster_id'], extra_data=f['extra_data']) for f in clustered_faces]
     return faces
 
@@ -117,73 +283,6 @@ def process_faces(video_graph, base64_frames, save_path, preprocessing=[]):
         faces = cluster_face(faces)
         return faces
 
-    def establish_mapping(faces, key="cluster_id", filter=None):
-        mapping = {}
-        for face in faces:
-            if key not in face.keys():
-                raise ValueError(f"key {key} not found in faces")
-            if filter and not filter(face):
-                continue
-            id = face[key]
-            if id not in mapping:
-                mapping[id] = []
-            mapping[id].append(face)
-        # sort the faces in each cluster by detection score and quality score
-        max_faces = processing_config["max_faces_per_character"]
-        for id in mapping:
-            mapping[id] = sorted(
-                mapping[id],
-                key=lambda x: (
-                    float(x["extra_data"]["face_detection_score"]),
-                    float(x["extra_data"]["face_quality_score"]),
-                ),
-                reverse=True,
-            )[:max_faces]
-        return mapping
-
-    def filter_score_based(face):
-        dthresh = processing_config["face_detection_score_threshold"]
-        qthresh = processing_config["face_quality_score_threshold"]
-        return float(face["extra_data"]["face_detection_score"]) > dthresh and float(face["extra_data"]["face_quality_score"]) > qthresh
-
-    def update_videograph(video_graph, tempid2faces):
-        id2faces = {}
-        for tempid, faces in tempid2faces.items():
-            if tempid == -1:
-                continue
-            if len(faces) == 0:
-                continue
-            face_info = {
-                "embeddings": [face["face_emb"] for face in faces],
-                "contents": [face["extra_data"]["face_base64"] for face in faces],
-            }
-            matched_nodes = video_graph.search_img_nodes(face_info)
-            if len(matched_nodes) > 0:
-                matched_node = matched_nodes[0][0]
-                video_graph.update_node(matched_node, face_info)
-                for face in faces:
-                    face["matched_node"] = matched_node
-            else:
-                matched_node = video_graph.add_img_node(face_info)
-                for face in faces:
-                    face["matched_node"] = matched_node
-            if matched_node not in id2faces:
-                id2faces[matched_node] = []
-            id2faces[matched_node].extend(faces)
-        
-        max_faces = processing_config["max_faces_per_character"]
-        for id, faces in id2faces.items():
-            id2faces[id] = sorted(
-                faces,
-                key=lambda x: (
-                    float(x["extra_data"]["face_detection_score"]),
-                    float(x["extra_data"]["face_quality_score"]),
-                ),
-                reverse=True
-            )[:max_faces]
-
-        return id2faces
-    
     # Check if intermediate results exist
     try:
         with open(save_path, "r") as f:
@@ -217,7 +316,7 @@ def process_faces(video_graph, base64_frames, save_path, preprocessing=[]):
     if len(tempid2faces) == 0:
         return {}
 
-    id2faces = update_videograph(video_graph, tempid2faces)
+    id2faces, _ = add_face_clusters_to_graph(video_graph, tempid2faces)
 
     return id2faces
 

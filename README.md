@@ -173,6 +173,64 @@ python m3_agent/control.py \
    --data_file data/annotations/robot.json
 ```
 
+### SimLife adapter
+
+> Full runbook + architecture notes: [`docs/simlife.md`](./docs/simlife.md).
+
+To run M3-Agent on the [SimLife](./SimLife-Data-HF) long-video benchmark, use
+the dedicated two-stage pipeline that decouples per-unit feature extraction
+(faces, speaker embeddings, Qwen captions) from per-chain graph assembly.
+Each SimLife video chain (`video_chain_id`) is one ordered sequence of 10–60
+~24 min "video units"; multiple task JSONs target the same chain with
+different `stop_day_position` values, so we build one memory graph per
+chain (50 chains across the 134 tasks) and let each task's questions
+reference the same graph with their own `before_clip`.
+
+ASR is taken directly from `log.jsonl` (`type==dialogue`), so Gemini
+diarization is not used; speaker embeddings are still computed from
+`dialogue_audio/session_*.wav`. Question prompts use the `*_vision` fields
+since M3-Agent is a VLM.
+
+```bash
+# 1) Build manifests (units.txt, data_units.jsonl, data_chains.jsonl, simlife.json)
+python m3_agent/simlife_data_prep.py
+
+# 2) Per-unit precomputation (heavy; SLURM array, one job per video unit)
+sbatch scripts/slurm_simlife_precompute_unit.sbatch
+# or locally for one unit:
+python m3_agent/simlife_precompute_unit.py --unit video_001285
+
+# 2b) Per-chain dialogue overrides (only chains under task_dialogue_audio/).
+#     Default re-runs Qwen for clips whose voices changed; Stage B requires
+#     matching voice+memory pair to use the override.
+sbatch scripts/slurm_simlife_apply_overrides.sbatch
+# or locally for one chain:
+python m3_agent/simlife_apply_dialogue_overrides.py --chain vc_000001 --regenerate_memories
+
+# 3) Per-chain graph assembly (cheap; CPU-only SLURM array, one job per chain)
+sbatch scripts/slurm_simlife_assemble_chain.sbatch
+# or locally for one chain:
+python m3_agent/simlife_assemble_chain.py --chain vc_000001
+
+# 4a) Sharded eval (each job pins 2 GPUs for vLLM; default NUM_SHARDS=8)
+NUM_SHARDS=8 sbatch scripts/slurm_simlife_eval.sbatch
+# 4b) Combine per-shard outputs once all jobs finish:
+python m3_agent/simlife_eval_combine.py --dataset simlife
+
+# OR run eval as a single un-sharded process:
+python m3_agent/control.py --data_file data/annotations/simlife.json
+```
+
+Outputs:
+- `data/clips/video_XXXXXX/{0..N}.mp4` — 30s silent clips
+- `data/intermediate/video_XXXXXX/clip_K_{faces,voices,memory}.json`
+- `data/memory_graphs/vc_XXXXXX.pkl` — one VideoGraph per video chain
+
+SimLife-specific config keys in `configs/processing_config.json`
+(`face_min_cluster_size`, `face_cluster_detection_threshold`,
+`face_cluster_quality_threshold`) relax thresholds because animated Sims
+faces score lower under InsightFace than real faces.
+
 ### Other Models
 
 If you want to prompt other models to generate memory or answer question, only need to change the model inference into api calling and use the corresponding prompt.

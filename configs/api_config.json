@@ -1,14 +1,19 @@
-{
-    "gpt-4o-2024-11-20": {
-        "base_url": "",
-        "api_key": ""
+  {
+    "gpt-4-0125-preview": {
+      "azure_endpoint": "https://gpt4-apicall.openai.azure.com/",
+      "api_key": "79e39d028b3b41ceabcaff2f4372faa7",
+      "api_version": "2024-12-01-preview",
+      "qpm": 20
     },
     "gemini-1.5-pro-002": {
-        "base_url": "",
-        "api_key": ""
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "api_key": "AIzaSyAsnTAi_QKzO4fIz1c87CaiwLMzadGasyE",
+      "model": "gemini-2.5-flash"
     },
     "text-embedding-3-large": {
-        "base_url": "",
-        "api_key": ""
+      "azure_endpoint": "https://gpt4-apicall.openai.azure.com/",
+      "api_key": "79e39d028b3b41ceabcaff2f4372faa7",
+      "api_version": "2023-05-15",
+      "qpm": 20
     }
-}
+  }
