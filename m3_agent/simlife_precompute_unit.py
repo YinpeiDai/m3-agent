@@ -172,7 +172,7 @@ def precompute_unit(unit_id, src_root="SimLife-Data-HF/video_units",
 
 def main():
     import time
-    time = time.time()
+    tstart = time.time()
     parser = argparse.ArgumentParser()
     parser.add_argument("--unit", required=True, help="e.g. video_001285")
     parser.add_argument("--src_root", default="SimLife-Data-HF/video_units")
@@ -197,7 +197,7 @@ def main():
         skip_memory=args.skip_memory,
     )
     
-    print(f"Precomputation for unit {args.unit} completed in {time.time() - time:.2f} seconds.")
+    print(f"Precomputation for unit {args.unit} completed in {time.time() - tstart:.2f} seconds.")
 
 
 if __name__ == "__main__":
