@@ -190,7 +190,7 @@ def precompute_unit(unit_id, src_root="SimLife-Data-HF/video_units",
                     "episodic": episodic,
                     "semantic": semantic,
                     "voice_speaker_order": speaker_order,
-                }, f)
+                }, f, indent=4)
             logger.info("[%s] wrote %s (epi=%d, sem=%d)",
                         unit_id, mem_path, len(episodic), len(semantic))
 
