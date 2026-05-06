@@ -217,7 +217,17 @@ def generate_memories(
     )
     return episodic_memories, semantic_memories
 
-def process_memories(video_graph, memory_contents, clip_id, type='episodic'):
+def process_memories(video_graph, memory_contents, clip_id, type='episodic',
+                     embeddings=None):
+    """Insert ``memory_contents`` (list[str]) into ``video_graph``.
+
+    ``embeddings``: optional list of per-text embeddings aligned with
+    ``memory_contents``. When provided we skip the
+    ``text-embedding-3-large`` API call entirely — Stage A4 caches
+    embeddings alongside the memory JSON, so chain assembly doesn't have
+    to re-fetch ~14k embeddings per chain on every rebuild. When ``None``
+    or wrong length we fall back to the original online behaviour.
+    """
     def get_memory_embeddings(memory_contents):
         # calculate the embedding for each memory
         model = 'text-embedding-3-large'
@@ -279,7 +289,16 @@ def process_memories(video_graph, memory_contents, clip_id, type='episodic'):
                 if create_new_node:
                     insert_memory(video_graph, memory, type)
     
-    memories_embeddings = get_memory_embeddings(memory_contents)
+    if embeddings is not None and len(embeddings) == len(memory_contents):
+        memories_embeddings = embeddings
+    else:
+        if embeddings is not None:
+            logger.warning(
+                "process_memories: %d cached embeddings != %d memory texts; "
+                "falling back to text-embedding-3-large API",
+                len(embeddings), len(memory_contents),
+            )
+        memories_embeddings = get_memory_embeddings(memory_contents)
 
     memories = []
     for memory, embedding in zip(memory_contents, memories_embeddings):

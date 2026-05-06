@@ -263,6 +263,7 @@ def _regenerate_memories(chain_id, unit_id, affected_clips, out_dir,
     """
     from m3_agent.simlife_precompute_unit import (
         _generate_memory_for_clip, _force_correct_equivalences,
+        _embed_memory_texts,
     )
 
     unit_inter = os.path.join(inter_root, unit_id)
@@ -300,11 +301,24 @@ def _regenerate_memories(chain_id, unit_id, affected_clips, out_dir,
         # in this clip's voice JSON (voice_speaker_order isn't needed —
         # voice ids are per-utterance now, indices into ``voices``).
         sem = _force_correct_equivalences(sem, voices)
+
+        # Cache embeddings so Stage B can skip the API call (same scheme
+        # as the default precompute flow).
+        try:
+            epi_emb = _embed_memory_texts(epi)
+            sem_emb = _embed_memory_texts(sem)
+        except Exception as e:
+            logger.warning("[%s/%s] embedding failed for clip %d: %s",
+                           chain_id, unit_id, k, e)
+            epi_emb, sem_emb = [], []
+
+        payload = {"episodic": epi, "semantic": sem}
+        if epi_emb and len(epi_emb) == len(epi):
+            payload["episodic_embeddings"] = epi_emb
+        if sem_emb and len(sem_emb) == len(sem):
+            payload["semantic_embeddings"] = sem_emb
         with open(out_path, "w") as f:
-            json.dump({
-                "episodic": epi,
-                "semantic": sem,
-            }, f)
+            json.dump(payload, f)
         regenerated.append(k)
     return regenerated
 

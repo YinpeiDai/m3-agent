@@ -23,6 +23,9 @@ import os
 import pickle
 import re
 import sys
+import time
+
+from tqdm import tqdm
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, ".."))
@@ -150,6 +153,34 @@ def _rewrite_ids(text, face_map, voice_map):
     return text
 
 
+def _filter_and_rewrite(raw_texts, raw_embeddings, face_map, voice_map):
+    """Drop empty raw entries (matching the original ``if t`` filter),
+    rewrite local ids in the kept ones, and **keep the embedding list
+    aligned**.
+
+    Returns ``(texts, embeddings)``. ``embeddings`` is ``None`` when the
+    caller didn't pass cached embeddings or when alignment broke (length
+    mismatch on input); ``process_memories`` then falls back to the API.
+
+    The cached embedding belongs to the *raw* text; rewriting only swaps
+    integers in ``<face_X>``/``<voice_Y>`` placeholders, so the embedding
+    of "<face_0> walks in" is functionally equivalent to that of
+    "<face_5> walks in" for retrieval. We don't re-embed.
+    """
+    texts = []
+    embs = [] if raw_embeddings is not None else None
+    if raw_embeddings is not None and len(raw_embeddings) != len(raw_texts):
+        # Alignment is broken at the source — silently fall back.
+        embs = None
+    for i, t in enumerate(raw_texts):
+        if not t:
+            continue
+        texts.append(_rewrite_ids(t, face_map, voice_map))
+        if embs is not None:
+            embs.append(raw_embeddings[i])
+    return texts, embs
+
+
 def _memory_filename(k, variant):
     """Two memory variants are written by Stage A4:
         clip_K_memory_audio.json    — Qwen with audio modality + voice JSON
@@ -247,7 +278,25 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="
     from the per-unit default.
     """
     graph = VideoGraph(**memory_config)
-    chain_id = chain_row.get("chain_id")
+    chain_id = chain_row.get("chain_id") or "?"
+
+    # Pre-scan the chain so the progress bar has a real total and we can
+    # warn about missing units up-front instead of mid-iteration.
+    units_to_process = []
+    total_clips = 0
+    for unit_id in chain_row["video_ids"]:
+        unit_dir = os.path.join(inter_root, unit_id)
+        if not os.path.isdir(unit_dir):
+            logger.warning("[%s] missing intermediate dir for %s; skipping", chain_id, unit_id)
+            continue
+        n = _count_clips(unit_dir)
+        if n == 0:
+            logger.warning("[%s] no face JSONs in %s; skipping", chain_id, unit_dir)
+            continue
+        units_to_process.append((unit_id, unit_dir, n))
+        total_clips += n
+    logger.info("[%s] %s variant: %d units, %d clips total",
+                chain_id, variant, len(units_to_process), total_clips)
 
     # Seed the four SimLife mains at fixed graph node ids before any clip
     # is processed. This way <face_0..3> mean Father/Mother/Son/Daughter in
@@ -261,26 +310,28 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="
     # prompt-side ``<voice_X>``s typically rewrite to the same graph
     # node id — but the graph node ids themselves are dynamic per chain.
 
-    for unit_idx, unit_id in enumerate(chain_row["video_ids"]):
-        unit_dir = os.path.join(inter_root, unit_id)
-        if not os.path.isdir(unit_dir):
-            logger.warning("Missing %s; skipping unit", unit_dir)
-            continue
-        n_clips = _count_clips(unit_dir)
-        if n_clips == 0:
-            logger.warning("No face JSONs in %s; skipping", unit_dir)
-            continue
-
+    pbar = tqdm(total=total_clips,
+                desc=f"{chain_id} ({variant})",
+                unit="clip",
+                dynamic_ncols=True)
+    chain_t0 = time.time()
+    for unit_idx, (unit_id, unit_dir, n_clips) in enumerate(units_to_process):
         override_dir = None
-        if chain_id:
+        if chain_id and chain_id != "?":
             candidate = os.path.join(inter_root, "per_chain", chain_id, unit_id)
             if os.path.isdir(candidate):
                 override_dir = candidate
 
+        unit_t0 = time.time()
+        unit_start_nodes = len(graph.nodes)
+        unit_start_text = sum(len(v) for v in graph.text_nodes_by_clip.values())
+        used_override_clips = 0
         for k in range(n_clips):
             face_path, voice_path, mem_path = _resolve_clip_paths(
                 unit_dir, override_dir, k, variant,
             )
+            if override_dir and os.path.dirname(mem_path) == override_dir:
+                used_override_clips += 1
 
             # Faces — replay cached cluster_ids through the graph and capture
             # the local->global label map before any top-K cap clobbers it.
@@ -311,21 +362,61 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="
                     )
 
             # Memory — rewrite ids, then process via existing pipeline.
+            # Cached embeddings (saved at Stage A4) are passed through so
+            # process_memories doesn't have to re-fetch from the
+            # text-embedding-3-large API on every chain rebuild.
             if not os.path.exists(mem_path):
+                pbar.update(1)
                 continue
             mem = json.load(open(mem_path))
             episodic_raw = mem.get("episodic", []) or []
             semantic_raw = mem.get("semantic", []) or []
-            episodic = [_rewrite_ids(t, face_map, voice_map) for t in episodic_raw if t]
-            semantic = [_rewrite_ids(t, face_map, voice_map) for t in semantic_raw if t]
+            episodic, epi_embs = _filter_and_rewrite(
+                episodic_raw, mem.get("episodic_embeddings"), face_map, voice_map,
+            )
+            semantic, sem_embs = _filter_and_rewrite(
+                semantic_raw, mem.get("semantic_embeddings"), face_map, voice_map,
+            )
 
             clip_id = unit_idx * CLIPS_PER_UNIT_OFFSET + k
             if episodic:
-                process_memories(graph, episodic, clip_id, type="episodic")
+                process_memories(graph, episodic, clip_id,
+                                 type="episodic", embeddings=epi_embs)
             if semantic:
-                process_memories(graph, semantic, clip_id, type="semantic")
+                process_memories(graph, semantic, clip_id,
+                                 type="semantic", embeddings=sem_embs)
 
+            pbar.update(1)
+            pbar.set_postfix(
+                unit=f"{unit_idx + 1}/{len(units_to_process)}",
+                clip=f"{k + 1}/{n_clips}",
+                nodes=len(graph.nodes),
+                text=sum(len(v) for v in graph.text_nodes_by_clip.values()),
+                edges=len(graph.edges),
+                refresh=False,
+            )
+
+        unit_elapsed = time.time() - unit_t0
+        added_nodes = len(graph.nodes) - unit_start_nodes
+        added_text = sum(len(v) for v in graph.text_nodes_by_clip.values()) - unit_start_text
+        logger.info(
+            "[%s] unit %d/%d %s done in %.1fs (+%d nodes, +%d text nodes)%s",
+            chain_id, unit_idx + 1, len(units_to_process), unit_id,
+            unit_elapsed, added_nodes, added_text,
+            f" [override clips: {used_override_clips}]" if used_override_clips else "",
+        )
+    pbar.close()
+
+    refresh_t0 = time.time()
+    logger.info("[%s] running refresh_equivalences()...", chain_id)
     graph.refresh_equivalences()
+    logger.info(
+        "[%s] %s assembled in %.1fs (refresh_equivalences=%.1fs): "
+        "nodes=%d edges=%d characters=%d",
+        chain_id, variant, time.time() - chain_t0, time.time() - refresh_t0,
+        len(graph.nodes), len(graph.edges),
+        len(getattr(graph, "character_mappings", {})),
+    )
     return graph
 
 
@@ -353,8 +444,20 @@ def main():
                              "(vc_NNN_noaudio.pkl) graphs.")
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # mmagent/__init__.py installs root handlers (or sets level to CRITICAL
+    # in training mode), so basicConfig() is a no-op here. Replace root
+    # handlers with one stderr handler at the requested level so progress
+    # logging is always visible without doubled output. tqdm will continue
+    # to write its bar to stderr alongside.
+    level = getattr(logging, args.log_level.upper())
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.setLevel(level)
+    root.addHandler(handler)
 
     memory_config = json.load(open(args.memory_config))
 

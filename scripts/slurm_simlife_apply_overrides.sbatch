@@ -1,12 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=sl-ovr
 #SBATCH --array=0-69%16
+#SBATCH --account=chaijy2
+#SBATCH --partition=spgpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
 #SBATCH --mem=48G
 #SBATCH --time=04:00:00
-#SBATCH --output=m3_agent_outputs/simlife_logs/apply_overrides_%A_%a.out
-#SBATCH --error=m3_agent_outputs/simlife_logs/apply_overrides_%A_%a.err
+#SBATCH --output=m3_agent_outputs/simlife_logs/apply_overrides_%A_%a.log
 
 # Stage A.5: apply per-chain dialogue overrides on top of the default per-unit
 # intermediate JSONs. Walks SimLife-Data-HF/task_dialogue_audio/ for chains with
@@ -22,11 +25,12 @@
 # Tune --array to ``ls SimLife-Data-HF/task_dialogue_audio | wc -l`` (default
 # 0-69 for the current 70 chains).
 
-set -eo pipefail
-cd "${SLURM_SUBMIT_DIR:-$PWD}"
+
+source /home/daiyp/.bashrc
+cd /home/daiyp/m3-agent
 
 REGENERATE_MEMORIES="${REGENERATE_MEMORIES:-1}"
-PY=/data/daiyp/micromamba/envs/m3a/bin/python
+PY=/nfs/turbo/coe-chaijy/daiyp/micromamba_gl/envs/m3a/bin/python
 
 # Build a sorted list of override-chain ids on the fly so we don't need a
 # separate manifest file.

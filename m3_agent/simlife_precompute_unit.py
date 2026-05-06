@@ -63,6 +63,20 @@ def _build_local_id2faces(faces_json):
     return {k: v for k, v in id2faces.items() if v}
 
 
+def _embed_memory_texts(texts):
+    """Embed a list of memory strings via text-embedding-3-large.
+
+    Returns ``[]`` for an empty input. Done at precompute time so Stage B
+    doesn't have to re-fetch ~14k embeddings per chain on every assemble
+    run. Embeddings are cached alongside the memory JSON; Stage B reads
+    them and bypasses the API call.
+    """
+    if not texts:
+        return []
+    from mmagent.utils.chat_api import parallel_get_embedding
+    return parallel_get_embedding("text-embedding-3-large", texts)[0]
+
+
 def _force_correct_equivalences(semantic, voice_entries):
     """Inject the correct ``Equivalence: <face_X>, <voice_Y>`` lines at
     the top of the semantic memory list.
@@ -259,11 +273,32 @@ def precompute_unit(unit_id, src_root="SimLife-Data-HF/video_units",
                 semantic = _force_correct_equivalences(semantic, voice_entries
                                                        if variant == "audio" else [])
 
+                # Cache text-embedding-3-large embeddings here so Stage B
+                # never has to re-fetch them — at SimLife scale that's
+                # ~14k API calls per chain rebuild otherwise. Failure to
+                # embed (network blip, missing creds) is caught and just
+                # leaves the embeddings out; Stage B falls back to the
+                # online path automatically.
+                try:
+                    epi_embeddings = _embed_memory_texts(episodic)
+                    sem_embeddings = _embed_memory_texts(semantic)
+                except Exception as e:
+                    logger.warning("[%s] embedding failed for clip %d (%s): %s; "
+                                   "Stage B will re-fetch on demand",
+                                   unit_id, k, variant, e)
+                    epi_embeddings, sem_embeddings = [], []
+
+                payload = {
+                    "episodic": episodic,
+                    "semantic": semantic,
+                }
+                if epi_embeddings and len(epi_embeddings) == len(episodic):
+                    payload["episodic_embeddings"] = epi_embeddings
+                if sem_embeddings and len(sem_embeddings) == len(semantic):
+                    payload["semantic_embeddings"] = sem_embeddings
+
                 with open(mem_path, "w") as f:
-                    json.dump({
-                        "episodic": episodic,
-                        "semantic": semantic,
-                    }, f, indent=4)
+                    json.dump(payload, f)
                 logger.info("[%s] wrote %s (epi=%d, sem=%d)",
                             unit_id, mem_path, len(episodic), len(semantic))
 
