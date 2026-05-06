@@ -211,6 +211,8 @@ python m3_agent/simlife_apply_dialogue_overrides.py --chain vc_000001 --regenera
 sbatch scripts/slurm_simlife_assemble_chain.sbatch
 # or locally for one chain:
 python m3_agent/simlife_assemble_chain.py --chain vc_000001
+# smoke test
+python m3_agent/simlife_assemble_chain.py --chain vc_000999 --data_chains data/simlife/data_chains_smoke.jsonl
 
 # 4a) Sharded eval (each job pins 2 GPUs for vLLM; default NUM_SHARDS=8)
 NUM_SHARDS=8 sbatch scripts/slurm_simlife_eval.sbatch

@@ -56,12 +56,19 @@ def question_to_qa(question, task_id, before_clip):
     """Build a control.py-compatible QA dict from a SimLife question, using the
     *_vision variants (the model is a VLM and the vision-targeted phrasing
     avoids leaking the canonical character names).
+
+    Pass-through ``variant``: when the source question carries a
+    ``variant`` key (``"audio"`` or ``"noaudio"``), copy it into the
+    output so control.py routes that question against the matching
+    memory-graph pickle. If the source uses ``mode`` instead, accept
+    that too. Absent either, control.py defaults to the ``audio``
+    pickle.
     """
     qid = f"task_{int(task_id):06d}_Q{int(question['task_question_id']):06d}"
     options = question["options_vision"]
     options_str = " | ".join(f"({chr(ord('A') + i)}) {o}" for i, o in enumerate(options))
     prompt = f"{question['question_vision']}\nOptions: {options_str}"
-    return {
+    out = {
         "question_id": qid,
         "question": prompt,
         "answer": question["answer_vision"],
@@ -71,6 +78,10 @@ def question_to_qa(question, task_id, before_clip):
         "task_id": int(task_id),
         "before_clip": before_clip,
     }
+    variant = question.get("variant") or question.get("mode")
+    if variant in ("audio", "noaudio"):
+        out["variant"] = variant
+    return out
 
 
 def compute_before_clip(task, unit_durations):

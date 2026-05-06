@@ -4,8 +4,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=02:00:00
-#SBATCH --output=m3_agent_outputs/simlife_logs/assemble_%A_%a.out
-#SBATCH --error=m3_agent_outputs/simlife_logs/assemble_%A_%a.err
+#SBATCH --output=m3_agent_outputs/simlife_logs/assemble_%A_%a.log
 
 # Stage B: per-video-chain graph assembly. CPU-only; uses text-embedding-3-large API.
 # One job per unique video_chain_id. Array length must match

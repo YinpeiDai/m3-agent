@@ -55,7 +55,10 @@ def main():
     out_path = args.out_path or os.path.join(args.results_dir, f"{args.dataset}.jsonl")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    by_qid = {}
+    # Key by (id, variant) so the same question evaluated under both
+    # audio + noaudio keeps both rows; legacy single-variant entries
+    # without a 'variant' field land under variant=''.
+    by_key = {}
     for p in shard_paths:
         with open(p) as f:
             for line in f:
@@ -64,17 +67,30 @@ def main():
                     continue
                 row = json.loads(line)
                 qid = row.get("id") or row.get("question_id")
-                by_qid[qid] = row
+                variant = row.get("variant", "")
+                by_key[(qid, variant)] = row
 
-    n_correct = sum(1 for r in by_qid.values() if r.get("gpt_eval"))
-    n_total = len(by_qid)
+    by_variant = {}  # variant -> [total, correct]
+    for (qid, variant), r in by_key.items():
+        bucket = by_variant.setdefault(variant or "?", [0, 0])
+        bucket[0] += 1
+        if r.get("gpt_eval"):
+            bucket[1] += 1
+    n_total = sum(b[0] for b in by_variant.values())
+    n_correct = sum(b[1] for b in by_variant.values())
 
     with open(out_path, "w") as f:
-        for qid in sorted(by_qid.keys()):
-            f.write(json.dumps(by_qid[qid], ensure_ascii=False) + "\n")
+        for key in sorted(by_key.keys()):
+            f.write(json.dumps(by_key[key], ensure_ascii=False) + "\n")
 
-    print(f"shards={len(shard_paths)} questions={n_total} correct={n_correct} "
-          f"accuracy={n_correct / n_total:.4f}" if n_total else "accuracy=NA")
+    overall_acc = (n_correct / n_total) if n_total else 0.0
+    print(f"shards={len(shard_paths)} entries={n_total} correct={n_correct} "
+          f"accuracy={overall_acc:.4f}")
+    for variant in sorted(by_variant):
+        t, c = by_variant[variant]
+        acc = (c / t) if t else 0.0
+        label = variant or "(no variant tag)"
+        print(f"  variant={label:18s} entries={t:6d} correct={c:6d} accuracy={acc:.4f}")
     print(f"  wrote {out_path}")
     if missing:
         print(f"  WARNING: missing shards {missing} (re-run those then re-combine)")

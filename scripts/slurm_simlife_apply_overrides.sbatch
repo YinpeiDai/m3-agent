@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=sl-ovr
-#SBATCH --array=0-69%16
+#SBATCH --array=0-69%12
 #SBATCH --account=chaijy2
 #SBATCH --partition=spgpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=5
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=48G
-#SBATCH --time=04:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=m3_agent_outputs/simlife_logs/apply_overrides_%A_%a.log
 
 # Stage A.5: apply per-chain dialogue overrides on top of the default per-unit
@@ -25,6 +25,10 @@
 # Tune --array to ``ls SimLife-Data-HF/task_dialogue_audio | wc -l`` (default
 # 0-69 for the current 70 chains).
 
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export NUMEXPR_NUM_THREADS=4
 
 source /home/daiyp/.bashrc
 cd /home/daiyp/m3-agent

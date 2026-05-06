@@ -31,5 +31,5 @@
     "ckpt": "models/M3-Agent-Memorization",
     "model": "qwen2.5-omni",
     "total_round": 5,
-    "batch_size": 64
+    "batch_size": 8
 }

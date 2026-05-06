@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=40G
-#SBATCH --time=05:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=m3_agent_outputs/simlife_logs/precompute_%A_%a.log
 
 

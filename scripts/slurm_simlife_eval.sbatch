@@ -1,25 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=sl-eval
 #SBATCH --array=0-7
+#SBATCH --account=chaijy2
+#SBATCH --partition=spgpu
 #SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=12:00:00
-#SBATCH --output=m3_agent_outputs/simlife_logs/eval_%A_%a.out
-#SBATCH --error=m3_agent_outputs/simlife_logs/eval_%A_%a.err
+#SBATCH --cpus-per-task=10
+#SBATCH --mem-per-gpu=46G
+#SBATCH --time=5-00:00:00
+#SBATCH --output=m3_agent_outputs/simlife_logs/eval_%A_%a.log
 
-# Stage C: sharded evaluation. Each job loads the M3-Agent-Control vLLM
-# model on 2 GPUs and processes a deterministic 1/N slice of the chain
-# pickles. Set --partition / --account / --qos for your cluster before
-# submitting. After all shards finish, run scripts/simlife_combine_eval.sh
-# (or the combiner directly) to merge per-shard outputs.
-#
-# Tune NUM_SHARDS to balance "throughput" vs "GPU footprint":
-#   - 50 chains, ~536 questions: NUM_SHARDS=8 puts ~6-7 chains (~67 questions)
-#     per shard. Sequential rounds ≈ 5; with batch_size=4, that's ~17 batches
-#     × 5 rounds × ~30s per round ≈ 40 minutes per shard, comfortably under
-#     the 12 h limit.
-#   - For a quicker run, raise NUM_SHARDS to 16 or 25 (one chain per shard).
 
 source /home/daiyp/.bashrc
 cd /home/daiyp/m3-agent
@@ -35,7 +24,7 @@ if [[ "$SLURM_ARRAY_TASK_ID" -ge "$NUM_SHARDS" ]]; then
 fi
 
 echo "[$(date)] shard=$SLURM_ARRAY_TASK_ID/$NUM_SHARDS data=$DATA_FILE host=$(hostname)"
-python m3_agent/control.py \
+PYTHONPATH=. python m3_agent/control.py \
     --data_file "$DATA_FILE" \
     --num_shards "$NUM_SHARDS" \
     --shard "$SLURM_ARRAY_TASK_ID" \
