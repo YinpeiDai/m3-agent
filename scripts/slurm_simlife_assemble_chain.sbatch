@@ -25,5 +25,8 @@ if [[ -z "$CHAIN" ]]; then
 fi
 
 echo "[$(date)] task=$SLURM_ARRAY_TASK_ID chain=$CHAIN host=$(hostname)"
-"$PY" m3_agent/simlife_assemble_chain.py --chain "$CHAIN"
-echo "[$(date)] done $CHAIN"
+# Build both memory-graph variants by default (audio + vision). Override with
+# VARIANT=audio or VARIANT=vision before sbatch to build only one.
+VARIANT="${VARIANT:-both}"
+"$PY" m3_agent/simlife_assemble_chain.py --chain "$CHAIN" --variant "$VARIANT"
+echo "[$(date)] done $CHAIN ($VARIANT)"

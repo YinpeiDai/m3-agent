@@ -23,13 +23,24 @@ without disturbing the per-unit defaults::
     data/intermediate/per_chain/<chain>/<unit>/clip_K_voices.json
     data/intermediate/per_chain/<chain>/<unit>/clip_K_memory.json   (if --regenerate_memories)
 
-**Atomic pairing rule.** If voices change for a clip, the Qwen-generated
-memory captions reference voice IDs that no longer match. Stage B therefore
-uses the per-chain pair *only* when both ``voices`` and ``memory`` files
-exist for that clip — otherwise it falls back to the default pair. So if
-you skip ``--regenerate_memories``, the override voice JSONs will sit
-unused; the override only takes effect once memories are regenerated for
-the same clips.
+**Atomic pairing rule.** Voice ids in Qwen's prompt are clip-local and
+**per-utterance** (the i-th entry in ``clip_K_voices.json`` is
+``<voice_i>``); same-speaker utterances are merged at the graph level by
+embedding cosine, but the prompt-side ids match the number of speech
+pieces. So when an override:
+
+  - swaps **only the audio + ASR text** of an existing session, the
+    clip-local voice-id count stays the same (one per utterance) — but
+    the dialogue *content* the captions reference doesn't, so captions
+    need a Qwen regeneration to stay truthful.
+  - adds or removes utterances, the per-utterance ids 0..N shift and
+    captions definitely need regen.
+
+Either way Stage B uses the per-chain pair *only* when both ``voices``
+and ``memory_audio`` files exist for that clip — otherwise it falls
+back to the default pair. So if you skip ``--regenerate_memories``,
+the override voice JSONs sit unused; the override only takes effect
+once memories are regenerated for the same clips.
 """
 import argparse
 import glob
@@ -158,12 +169,21 @@ def process_chain_unit(chain_id, unit_id, *,
     # bit-identical to the default per-unit voice JSON, so re-emitting them
     # just wastes ERes2NetV2 inference. Stage B's atomic pairing rule plus
     # the fallback to the default pair makes those clips work transparently.
-    affected_clips = sorted({
-        int(utt["abs_start_sec"] // CLIP_INTERVAL_SEC)
-        for utt in iter_utterances(merged)
-        if utt["session_id"] in override_sessions
-        and 0 <= int(utt["abs_start_sec"] // CLIP_INTERVAL_SEC) < n_clips
-    })
+    #
+    # We union the default and override utterance positions so we still
+    # cover clips where the override REMOVED utterances (e.g., a session
+    # became silent in the override) — those clips need memory regen too,
+    # because the default memory text still references speech that no
+    # longer happens.
+    affected_clips = set()
+    for source_events in (default_events, override_events):
+        for utt in iter_utterances(source_events):
+            if utt["session_id"] not in override_sessions:
+                continue
+            k = int(utt["abs_start_sec"] // CLIP_INTERVAL_SEC)
+            if 0 <= k < n_clips:
+                affected_clips.add(k)
+    affected_clips = sorted(affected_clips)
 
     os.makedirs(out_dir, exist_ok=True)
     build_voice_jsons(
@@ -215,28 +235,41 @@ def process_chain_unit(chain_id, unit_id, *,
 
 def _regenerate_memories(chain_id, unit_id, affected_clips, out_dir,
                          inter_root, chain_clip_dir=None, overwrite=False):
-    """Re-run Qwen for the clips whose override voice JSON we just wrote.
+    """Re-run Qwen for the **audio** memory variant of clips whose override
+    voice JSON we just wrote.
+
+    Only the audio variant changes when an override swaps in different
+    dialogue audio + ASR; the vision-only variant of the memory
+    (``clip_K_memory_vision.json``) doesn't depend on the audio modality
+    at all and is safely shared with the per-unit defaults. We therefore
+    regen exactly one file per affected clip:
+    ``<out_dir>/clip_K_memory_audio.json``. Stage B's atomic-pairing
+    rule for the audio variant requires both
+    ``clip_K_voices.json`` (override) and ``clip_K_memory_audio.json``
+    (override) to be present; otherwise the default audio pair is used.
+    The vision variant always reads from the per-unit default.
 
     ``affected_clips`` is the set the caller already computed from
     ``override_sessions``: every clip with at least one overridden
-    utterance. Other clips inherit the default memory JSON via Stage B's
-    atomic-pairing fallback.
+    utterance.
 
-    ``chain_clip_dir`` is where per-(chain, unit) override clip MP4s live;
-    Qwen reads those (audio = override) instead of the default per-unit
-    clips (audio = default). When None we fall back to defaults — but
-    that defeats the override for the audio modality.
+    ``chain_clip_dir`` is where per-(chain, unit) override clip MP4s
+    live; Qwen reads those (audio = override) instead of the default
+    per-unit clips (audio = default). When None we fall back to defaults
+    — but that defeats the override for the audio modality.
 
     Imported lazily so callers that don't pass --regenerate_memories can run
     without paying the Qwen-Omni model load cost.
     """
-    from m3_agent.simlife_precompute_unit import _generate_memory_for_clip, _voice_speaker_grouping
+    from m3_agent.simlife_precompute_unit import (
+        _generate_memory_for_clip, _force_correct_equivalences,
+    )
 
     unit_inter = os.path.join(inter_root, unit_id)
     default_clip_root = os.path.join("data", "clips", unit_id)
     regenerated = []
     for k in affected_clips:
-        out_path = os.path.join(out_dir, f"clip_{k}_memory.json")
+        out_path = os.path.join(out_dir, f"clip_{k}_memory_audio.json")
         if os.path.exists(out_path) and not overwrite:
             continue
         voice_path = os.path.join(out_dir, f"clip_{k}_voices.json")
@@ -256,17 +289,21 @@ def _regenerate_memories(chain_id, unit_id, affected_clips, out_dir,
         voices = json.load(open(voice_path))
         faces = json.load(open(face_path))
         try:
-            epi, sem = _generate_memory_for_clip(clip_path, faces, voices)
+            epi, sem = _generate_memory_for_clip(
+                clip_path, faces, voices, use_audio_in_video=True,
+            )
         except Exception as e:
-            logger.exception("[%s/%s] memory regen failed for clip %d: %s",
+            logger.exception("[%s/%s] audio-memory regen failed for clip %d: %s",
                              chain_id, unit_id, k, e)
             epi, sem = [], []
-        _, speaker_order = _voice_speaker_grouping(voices)
+        # Force correct Equivalence lines using the override speaker labels
+        # in this clip's voice JSON (voice_speaker_order isn't needed —
+        # voice ids are per-utterance now, indices into ``voices``).
+        sem = _force_correct_equivalences(sem, voices)
         with open(out_path, "w") as f:
             json.dump({
                 "episodic": epi,
                 "semantic": sem,
-                "voice_speaker_order": speaker_order,
             }, f)
         regenerated.append(k)
     return regenerated

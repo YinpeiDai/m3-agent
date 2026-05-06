@@ -25,12 +25,18 @@ temp = processing_config["temperature"]
 MAX_RETRIES = processing_config["max_retries"]
 processor, thinker = None, None
 
-def get_response(messages):
-    """Get chat completion response from specified model.
+def get_response(messages, use_audio_in_video=True):
+    """Get chat completion response from Qwen2.5-Omni.
 
     Args:
-        model (str): Model identifier
-        messages (list): List of message dictionaries
+        messages: List of message dictionaries (Qwen chat format).
+        use_audio_in_video: When False, the audio modality is disabled —
+            ``process_mm_info``, the processor, and ``thinker.generate``
+            all run with ``use_audio_in_video=False``, so even if the
+            input mp4 carries an audio stream, Qwen ignores it. Use this
+            for SimLife's "vision only" memory variant: the same audio'd
+            clips on disk get fed twice (once with audio, once without)
+            and we save two memory JSONs per clip.
 
     Returns:
         tuple: (response content, total tokens used)
@@ -47,25 +53,24 @@ def get_response(messages):
         processor = Qwen2_5OmniProcessor.from_pretrained(processing_config["ckpt"])
     text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     generation_config = GenerationConfig(pad_token_id=151643, bos_token_id=151644, eos_token_id=151645)
-    
-    USE_AUDIO_IN_VIDEO = True
-    audios, images, videos = process_mm_info(messages, use_audio_in_video=USE_AUDIO_IN_VIDEO)
-    inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=USE_AUDIO_IN_VIDEO)
+
+    audios, images, videos = process_mm_info(messages, use_audio_in_video=use_audio_in_video)
+    inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=use_audio_in_video)
     inputs = inputs.to(thinker.device).to(thinker.dtype)
 
     # Inference: Generation of the output text and audio
     with torch.no_grad():
-        generation = thinker.generate(**inputs, generation_config=generation_config, use_audio_in_video=USE_AUDIO_IN_VIDEO, max_new_tokens=4096, do_sample=True, temperature=temp)
+        generation = thinker.generate(**inputs, generation_config=generation_config, use_audio_in_video=use_audio_in_video, max_new_tokens=4096, do_sample=True, temperature=temp)
         generate_ids = generation[:, inputs.input_ids.size(1):]
         response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         token_count = len(generation[0])
-        
+
     # Clean up
     del generation
     del generate_ids
     del inputs
     torch.cuda.empty_cache()
-    
+
     return response, token_count
 
 def generate_messages(inputs):

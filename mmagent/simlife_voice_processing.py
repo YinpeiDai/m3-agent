@@ -241,8 +241,23 @@ def build_unit_voice_jsons(unit_dir, out_dir, n_clips, clip_interval_sec=CLIP_IN
 
 
 def update_videograph_from_cache(video_graph, audios):
-    """Mirror of mmagent/voice_processing.py:update_videograph (reimplemented to
-    avoid that closure being unreachable from outside its parent function).
+    """Fold one clip's cached voice JSON into ``video_graph``.
+
+    Per-utterance: every entry in ``audios`` (one utterance) is matched
+    against existing voice nodes via cosine similarity (≥
+    ``audio_matching_threshold``); same-speaker utterances therefore
+    typically *merge into the same graph voice node* without us having
+    to know speaker names. New utterances that don't match any existing
+    node create a fresh voice node.
+
+    The clip-local prompt id (``<voice_X>``) is NOT decided here — we
+    keep one id per utterance (assigned in voice-JSON order by
+    ``_voice_speaker_grouping`` in
+    ``m3_agent.simlife_precompute_unit``). Stage B's
+    ``_build_voice_local_to_global`` then maps each utterance index to
+    the matched_node we wrote here, so two utterances that the graph
+    merged into one node both rewrite to the same ``<voice_node_id>`` in
+    the final memory text.
     """
     id2audios = {}
     for audio in audios:

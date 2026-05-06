@@ -169,7 +169,13 @@ def main():
             base = group[0]
             chain_id = chain_basename(vc)
             video_ids = [unit_dir_name(v) for v in base["video_ids"]]
-            mem_path = os.path.join("data", "memory_graphs", f"{chain_id}.pkl")
+            base_mem_path = os.path.join("data", "memory_graphs", f"{chain_id}.pkl")
+            # Stage B writes one pickle per memory variant — audio (Qwen
+            # with the audio modality on) and noaudio (vision-only).
+            # ``mem_path`` (without suffix) is kept for backward
+            # compatibility with any legacy single-variant pipeline.
+            mem_path_audio = os.path.join("data", "memory_graphs", f"{chain_id}_audio.pkl")
+            mem_path_noaudio = os.path.join("data", "memory_graphs", f"{chain_id}_noaudio.pkl")
 
             row = {
                 "chain_id": chain_id,
@@ -178,7 +184,9 @@ def main():
                 "intermediate_dirs": [
                     os.path.join("data", "intermediate", u) for u in video_ids
                 ],
-                "mem_path": mem_path,
+                "mem_path": base_mem_path,                # legacy, unsuffixed
+                "mem_path_audio": mem_path_audio,
+                "mem_path_noaudio": mem_path_noaudio,
                 "task_ids": [int(t["task_id"]) for t in group],
             }
             f_chains.write(json.dumps(row) + "\n")
@@ -193,7 +201,13 @@ def main():
                     qa_list.append(question_to_qa(q, task["task_id"], before_clip))
             annotations[chain_id] = {
                 "video_path": "",
-                "mem_path": mem_path,
+                # Default ``mem_path`` points at the audio-variant pickle so
+                # control.py works without changes; the noaudio pickle
+                # path is exposed alongside for evaluators that route
+                # per-question.
+                "mem_path": mem_path_audio,
+                "mem_path_audio": mem_path_audio,
+                "mem_path_noaudio": mem_path_noaudio,
                 "video_chain_id": vc,
                 "task_ids": [int(t["task_id"]) for t in group],
                 "qa_list": qa_list,

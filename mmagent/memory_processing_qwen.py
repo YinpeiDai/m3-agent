@@ -141,43 +141,80 @@ def generate_video_context(
 
     return video_context
 
-def generate_all_memories(video_context, model_type="sft"):
+def generate_all_memories(video_context, model_type="sft", use_audio_in_video=True):
     input = [
         {
             "type": "text",
             "content": prompt_generate_memory_with_ids_sft,
         },
     ] + video_context
-    
+
     messages = generate_messages(input)
     epi_key = "video_descriptions"
     sem_key = "high_level_conclusions"
-    
+
+    last_raw = None
     memories = None
     for i in range(MAX_RETRIES):
-        memories_string = get_response(messages)[0]
+        memories_string = get_response(messages, use_audio_in_video=use_audio_in_video)[0]
+        last_raw = memories_string
         if not memories_string:
+            logger.warning("Qwen returned empty string (attempt %d/%d)", i + 1, MAX_RETRIES)
             memories_string = "[]"
         memories = validate_and_fix_json(memories_string)
         if memories is not None:
             break
+        logger.warning(
+            "Qwen output failed JSON parse (attempt %d/%d); first 200 chars: %r",
+            i + 1, MAX_RETRIES, memories_string[:200],
+        )
+
     if memories is None:
-        memories = {
-            epi_key: [],
-            sem_key: []
-        }
-        # raise Exception("Failed to generate memories")
-    
-    episodic_memories = memories[epi_key]
-    semantic_memories = memories[sem_key]
-    
+        logger.error(
+            "All %d Qwen attempts failed to parse. Saving empty memory. "
+            "Last raw response (first 500 chars): %r",
+            MAX_RETRIES, (last_raw or "")[:500],
+        )
+        memories = {epi_key: [], sem_key: []}
+
+    # Tolerate partial responses (one of the two keys missing or null) and
+    # report what we kept vs. dropped, so a borderline Qwen output still
+    # contributes whatever it produced instead of silently zeroing out.
+    episodic_memories = memories.get(epi_key) or []
+    semantic_memories = memories.get(sem_key) or []
+    if memories and (not isinstance(episodic_memories, list) or not isinstance(semantic_memories, list)):
+        logger.warning(
+            "Qwen output keys present but wrong type: "
+            "%s=%s, %s=%s; coercing to empty list",
+            epi_key, type(episodic_memories).__name__,
+            sem_key, type(semantic_memories).__name__,
+        )
+        episodic_memories = episodic_memories if isinstance(episodic_memories, list) else []
+        semantic_memories = semantic_memories if isinstance(semantic_memories, list) else []
+    if memories and (epi_key not in memories or sem_key not in memories):
+        logger.warning(
+            "Qwen output missing expected keys; got %s",
+            sorted(memories.keys()) if isinstance(memories, dict) else type(memories).__name__,
+        )
+
     return episodic_memories, semantic_memories
 
 def generate_memories(
-    base64_frames, faces_list, voices_list, video_path, model_type="sft"
+    base64_frames, faces_list, voices_list, video_path, model_type="sft",
+    use_audio_in_video=True,
 ):
+    """Run Qwen2.5-Omni to generate episodic + semantic captions for a clip.
+
+    ``use_audio_in_video=False`` disables the audio modality at the model
+    level. Combine with ``voices_list={}`` to produce SimLife's
+    "vision-only" memory variant — Qwen sees the visual frames and the
+    face crops but neither hears the dialogue audio nor sees voice JSON
+    in its prompt.
+    """
     video_context = generate_video_context(base64_frames, faces_list, voices_list, video_path)
-    episodic_memories, semantic_memories = generate_all_memories(video_context, model_type)
+    episodic_memories, semantic_memories = generate_all_memories(
+        video_context, model_type, use_audio_in_video=use_audio_in_video,
+    )
     return episodic_memories, semantic_memories
 
 def process_memories(video_graph, memory_contents, clip_id, type='episodic'):

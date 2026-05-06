@@ -51,9 +51,83 @@ def filter_score_based(face):
     )
 
 
+def _avatar_remap_table(pool_faces, raw_labels, references,
+                        avatar_match_threshold=0.3):
+    """Decide how to renumber HDBSCAN's raw labels so the four SimLife
+    main characters (Father/Mother/Son/Daughter) take fixed cluster_ids
+    0..3, anyone else takes 4..N.
+
+    Strategy:
+      1. For each non-noise raw cluster, take the centroid of its face
+         embeddings (already normalized by InsightFace).
+      2. Match each centroid against the four avatar embeddings; if the
+         best-matching avatar's similarity is above
+         ``avatar_match_threshold``, anchor the cluster to that fixed id.
+      3. **Multiple raw clusters may anchor to the same avatar.** This is
+         deliberate: HDBSCAN often splits one identity across several
+         clusters (different poses, different sessions), and the greedy
+         "one cluster per avatar" rule was discarding the bigger, more
+         representative cluster in favour of one that happens to look
+         more like the head-shot avatar. Letting them all merge means the
+         fixed-id slots actually capture the main characters' total
+         screen-time.
+      4. Anything below threshold gets the next free id starting at
+         len(references).
+
+    Returns:
+        ``{raw_label: new_label}`` (always includes ``-1: -1``).
+    """
+    import numpy as np
+    from collections import defaultdict
+
+    raw_to_indices = defaultdict(list)
+    for i, lbl in enumerate(raw_labels):
+        raw_to_indices[int(lbl)].append(i)
+
+    raw_to_fixed = {}
+    raw_to_best_sim = {}
+    for raw, idxs in raw_to_indices.items():
+        if raw == -1:
+            continue
+        embs = np.asarray([pool_faces[i]["face_emb"] for i in idxs], dtype=np.float32)
+        # Re-normalize the centroid; InsightFace's normed_embedding is unit-norm
+        # but the average of unit vectors generally is not.
+        centroid = embs.mean(axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm > 0:
+            centroid = centroid / norm
+        best_id, best_sim = None, -1.0
+        for ref in references:
+            emb = ref.get("embedding")
+            if emb is None:
+                continue
+            sim = float(np.dot(centroid, np.asarray(emb, dtype=np.float32)))
+            if sim > best_sim:
+                best_id, best_sim = int(ref["fixed_id"]), sim
+        if best_id is not None and best_sim >= avatar_match_threshold:
+            raw_to_fixed[raw] = best_id
+            raw_to_best_sim[raw] = best_sim
+
+    n_fixed = len(references)
+    next_free = n_fixed
+    remap = {-1: -1}
+    for raw in raw_to_indices:
+        if raw == -1:
+            continue
+        if raw in raw_to_fixed:
+            remap[raw] = raw_to_fixed[raw]
+        else:
+            remap[raw] = next_free
+            next_free += 1
+    return remap
+
+
 def recluster_unit_faces(intermediate_dir, min_cluster_size=None,
-                         distance_threshold=0.5):
-    """Re-cluster face detections across all clips of one unit.
+                         distance_threshold=0.5,
+                         use_avatar_anchors=True,
+                         avatar_match_threshold=None):
+    """Re-cluster face detections across all clips of one unit, optionally
+    pinning the four SimLife main characters to fixed cluster_ids 0..3.
 
     Per-clip HDBSCAN is data-starved: 30 s clips often hold fewer than
     ``face_min_cluster_size`` "good" faces, so most detections end up
@@ -62,14 +136,17 @@ def recluster_unit_faces(intermediate_dir, min_cluster_size=None,
     gives clustering enough density to find characters, then we write the
     unit-wide ``cluster_id`` back into each per-clip JSON.
 
-    Each face's stored ``cluster_id`` becomes a *unit-level* identifier:
-    all detections of the same character across all clips share one id.
-    Stage B's cross-clip cosine matching still merges identities across
-    *units* but no longer has to compensate for per-clip noise within a
-    unit.
+    With ``use_avatar_anchors=True`` (default) the resulting cluster_ids
+    are also remapped against the avatar references at
+    ``data/intermediate/_avatars/``, so the four mains end up on the same
+    integers in *every* unit:
 
-    The ``cluster_id`` previously written by ``process_faces`` (a per-clip
-    label) is preserved as ``cluster_id_per_clip`` for debugging.
+        0 = Father Sim, 1 = Mother Sim, 2 = Son Sim, 3 = Daughter Sim
+        >= 4 = anyone else (assigned in arbitrary HDBSCAN order)
+
+    The original per-clip cluster_id is preserved as ``cluster_id_per_clip``
+    for debugging; the original raw HDBSCAN id (pre-remap) is preserved as
+    ``cluster_id_raw``.
 
     Args:
         intermediate_dir: ``data/intermediate/<unit_id>/``.
@@ -77,6 +154,13 @@ def recluster_unit_faces(intermediate_dir, min_cluster_size=None,
             ``processing_config["face_min_cluster_size"]``.
         distance_threshold: cosine-similarity threshold; HDBSCAN ``eps``
             becomes ``1 - distance_threshold``.
+        use_avatar_anchors: when True, remap clusters that match the
+            avatar references onto fixed ids 0..3. Set to False for
+            diagnostics or non-SimLife data.
+        avatar_match_threshold: minimum cosine similarity between a
+            cluster centroid and an avatar embedding to count as a match.
+            ``None`` (default) reads
+            ``processing_config["avatar_match_threshold"]`` (default 0.3).
 
     Returns:
         ``{cluster_id: count}`` dict — total clusters formed and the
@@ -87,6 +171,8 @@ def recluster_unit_faces(intermediate_dir, min_cluster_size=None,
 
     if min_cluster_size is None:
         min_cluster_size = processing_config.get("face_min_cluster_size", 3)
+    if avatar_match_threshold is None:
+        avatar_match_threshold = processing_config.get("avatar_match_threshold", 0.3)
 
     paths = sorted(
         glob.glob(os.path.join(intermediate_dir, "clip_*_faces.json")),
@@ -111,20 +197,42 @@ def recluster_unit_faces(intermediate_dir, min_cluster_size=None,
         min_cluster_size=min_cluster_size,
         distance_threshold=distance_threshold,
     )
-    new_label = {(t[0], t[1]): rf["cluster_id"]
-                 for t, rf in zip(pool, relabeled)}
+    raw_labels = [int(rf["cluster_id"]) for rf in relabeled]
+    raw_label_by_pos = {(t[0], t[1]): raw_labels[i]
+                        for i, t in enumerate(pool)}
+
+    # Build the raw -> remapped table. With avatar anchors, the four mains
+    # collapse to fixed ids 0..3; otherwise the raw HDBSCAN ids carry through.
+    if use_avatar_anchors:
+        from .simlife_avatars import load_avatar_references
+        try:
+            references = load_avatar_references()
+        except Exception as e:
+            logger.warning("[%s] avatar references unavailable (%s); "
+                           "skipping avatar anchoring", intermediate_dir, e)
+            references = []
+        if references:
+            remap = _avatar_remap_table(
+                pool_faces, raw_labels, references,
+                avatar_match_threshold=avatar_match_threshold,
+            )
+        else:
+            remap = {raw: raw for raw in set(raw_labels)}
+    else:
+        remap = {raw: raw for raw in set(raw_labels)}
+    remap.setdefault(-1, -1)
 
     # Rewrite each per-clip JSON. Faces in the pool get the unit-level id;
     # faces that didn't pass the score filter (and so weren't reclustered)
-    # are forced to -1 so they're treated as noise everywhere — without
-    # this, stale per-clip ids would collide with the new unit-level ones.
+    # are forced to -1 so they're treated as noise everywhere.
     summary = Counter()
     for ci, p in enumerate(paths):
         faces = json.load(open(p))
         for fi, f in enumerate(faces):
-            old = f.get("cluster_id", -1)
-            f["cluster_id_per_clip"] = old
-            new = new_label.get((ci, fi), -1)
+            f["cluster_id_per_clip"] = f.get("cluster_id", -1)
+            raw = raw_label_by_pos.get((ci, fi), -1)
+            f["cluster_id_raw"] = int(raw)
+            new = remap.get(raw, -1)
             f["cluster_id"] = int(new)
             summary[int(new)] += 1
         with open(p, "w") as out:

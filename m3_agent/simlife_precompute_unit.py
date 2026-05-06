@@ -36,22 +36,22 @@ CLIP_INTERVAL_SEC = 30
 
 
 def _voice_speaker_grouping(voice_entries):
-    """Return ``id2voices`` keyed by per-clip speaker index (deterministic order
-    of first appearance), and a parallel ``speaker_order`` list. The same
-    grouping is recomputed verbatim at stage B; consistency is what makes
-    local IDs translatable.
+    """Return ``id2voices`` keyed by clip-local **per-utterance** voice id.
+
+    Each utterance gets its own id (0..N-1 in ``voice_entries`` order):
+
+        {0: [utt0], 1: [utt1], 2: [utt2], ...}
+
+    Two utterances by the same speaker therefore land on different prompt
+    ids — Qwen sees one ``<voice_X>`` per piece of speech. Stage B's
+    ``update_videograph_from_cache`` still merges same-speaker utterances
+    into one **graph voice node** via embedding similarity, so the
+    different ``<voice_X>`` refs typically *rewrite to the same graph node
+    id* in the final memory text. The prompt-side count of voice ids
+    matches the number of utterances; the graph-side count matches the
+    number of distinct speakers.
     """
-    speaker_order = []
-    seen = {}
-    id2voices = {}
-    for entry in voice_entries:
-        spk = entry.get("speaker") or "unknown"
-        if spk not in seen:
-            seen[spk] = len(speaker_order)
-            speaker_order.append(spk)
-        idx = seen[spk]
-        id2voices.setdefault(idx, []).append(entry)
-    return id2voices, speaker_order
+    return {i: [entry] for i, entry in enumerate(voice_entries)}
 
 
 def _build_local_id2faces(faces_json):
@@ -63,9 +63,56 @@ def _build_local_id2faces(faces_json):
     return {k: v for k, v in id2faces.items() if v}
 
 
-def _generate_memory_for_clip(clip_path, faces_json, voice_entries):
-    """Run Qwen2.5-Omni on a single clip. Lazy import keeps the heavy model out
-    of the import path for non-Qwen stages (e.g., the prep / voice-only runs).
+def _force_correct_equivalences(semantic, voice_entries):
+    """Inject the correct ``Equivalence: <face_X>, <voice_Y>`` lines at
+    the top of the semantic memory list.
+
+    Why we can do this: per-utterance voice ids are exactly the indices
+    in ``voice_entries`` (see ``_voice_speaker_grouping``), and
+    ``recluster_unit_faces`` anchored the four mains' face cluster_ids
+    to ``NAME_TO_FIXED_ID``. So whenever an utterance's speaker is one
+    of the four mains we can derive::
+
+        "Equivalence: <face_{NAME_TO_FIXED_ID[speaker]}>, <voice_{i}>"
+
+    deterministically from the data — Qwen doesn't need to guess.
+
+    We strip any ``Equivalence:`` lines Qwen produced (they're often
+    missing or partially wrong) and prepend our derived list. Speakers
+    not in NAME_TO_FIXED_ID (e.g., Servo Bot, visitors) are skipped:
+    we don't know which face cluster id they took.
+
+    Stage B relies on the ``<face_0..3>`` references being resolvable
+    even when the speaker's face doesn't visually appear in this clip;
+    that's handled in ``simlife_assemble_chain._process_clip_faces``,
+    which seeds the cluster→node map with the avatar identity mapping.
+    """
+    from mmagent.simlife_avatars import NAME_TO_FIXED_ID
+
+    cleaned = [s for s in semantic
+               if not str(s).strip().lower().startswith("equivalence:")]
+    derived = []
+    for i, entry in enumerate(voice_entries):
+        spk = entry.get("speaker")
+        if spk in NAME_TO_FIXED_ID:
+            derived.append(
+                f"Equivalence: <face_{NAME_TO_FIXED_ID[spk]}>, <voice_{i}>"
+            )
+    return derived + cleaned
+
+
+def _generate_memory_for_clip(clip_path, faces_json, voice_entries,
+                              use_audio_in_video=True):
+    """Run Qwen2.5-Omni on a single clip in either audio or vision-only mode.
+
+    Lazy import keeps the heavy model out of the import path for non-Qwen
+    stages (e.g., the prep / voice-only runs).
+
+    When ``use_audio_in_video=False`` we also pass an empty
+    ``voices_list={}`` so Qwen sees neither the dialogue audio (model-side
+    audio modality off) nor the voice JSON in its prompt — that matches
+    SimLife's "vision only" task setting where the answer must come from
+    visual cues alone.
     """
     from mmagent.memory_processing_qwen import generate_memories
 
@@ -73,12 +120,12 @@ def _generate_memory_for_clip(clip_path, faces_json, voice_entries):
     if not base64_frames:
         return [], []
     id2faces = _build_local_id2faces(faces_json)
-    id2voices, _ = _voice_speaker_grouping(voice_entries)
+    id2voices = _voice_speaker_grouping(voice_entries) if use_audio_in_video else {}
 
-    if not id2faces and not id2voices:
-        # Still ask Qwen for a description; just won't include face/voice IDs.
-        return generate_memories(base64_frames, {}, {}, clip_path)
-    return generate_memories(base64_frames, id2faces, id2voices, clip_path)
+    return generate_memories(
+        base64_frames, id2faces, id2voices, clip_path,
+        use_audio_in_video=use_audio_in_video,
+    )
 
 
 def _list_existing_clips(clip_dir):
@@ -165,34 +212,60 @@ def precompute_unit(unit_id, src_root="SimLife-Data-HF/video_units",
         build_unit_voice_jsons(src_dir, inter_dir, n_clips)
         logger.info("[%s] wrote voice JSONs", unit_id)
 
-    # A4 — memory JSON per clip via Qwen2.5-Omni
+    # A4 — memory JSON per clip via Qwen2.5-Omni, in two variants:
+    #   audio   -> use_audio_in_video=True  + full voice JSON in prompt
+    #   noaudio -> use_audio_in_video=False + voices stripped from prompt
+    # Files: clip_K_memory_audio.json, clip_K_memory_noaudio.json
     if not skip_memory:
+        variants = [
+            ("audio", True),
+            ("noaudio", False),
+        ]
         for k in range(n_clips):
-            mem_path = os.path.join(inter_dir, f"clip_{k}_memory.json")
-            if os.path.exists(mem_path):
-                continue
             face_path = os.path.join(inter_dir, f"clip_{k}_faces.json")
             voice_path = os.path.join(inter_dir, f"clip_{k}_voices.json")
             if not (os.path.exists(face_path) and os.path.exists(voice_path)):
                 logger.warning("[%s] missing face/voice for clip %d, skipping memory", unit_id, k)
                 continue
-            faces_json = json.load(open(face_path))
-            voice_entries = json.load(open(voice_path))
-            clip_path = os.path.join(clip_dir, f"{k}.mp4")
-            try:
-                episodic, semantic = _generate_memory_for_clip(clip_path, faces_json, voice_entries)
-            except Exception as e:
-                logger.exception("[%s] memory generation failed for clip %d: %s", unit_id, k, e)
-                episodic, semantic = [], []
-            _, speaker_order = _voice_speaker_grouping(voice_entries)
-            with open(mem_path, "w") as f:
-                json.dump({
-                    "episodic": episodic,
-                    "semantic": semantic,
-                    "voice_speaker_order": speaker_order,
-                }, f, indent=4)
-            logger.info("[%s] wrote %s (epi=%d, sem=%d)",
-                        unit_id, mem_path, len(episodic), len(semantic))
+            faces_json = None       # lazy-loaded once per clip
+            voice_entries = None
+            for variant, use_audio in variants:
+                mem_path = os.path.join(inter_dir, f"clip_{k}_memory_{variant}.json")
+                if os.path.exists(mem_path):
+                    continue
+                if faces_json is None:
+                    faces_json = json.load(open(face_path))
+                    voice_entries = json.load(open(voice_path))
+                clip_path = os.path.join(clip_dir, f"{k}.mp4")
+                try:
+                    episodic, semantic = _generate_memory_for_clip(
+                        clip_path, faces_json, voice_entries,
+                        use_audio_in_video=use_audio,
+                    )
+                except Exception as e:
+                    logger.exception("[%s] memory generation (%s) failed for clip %d: %s",
+                                     unit_id, variant, k, e)
+                    episodic, semantic = [], []
+
+                # Force correct Equivalence lines for the audio variant —
+                # we know each utterance's speaker name from the voice
+                # JSON and which face cluster id is anchored to each main,
+                # so deriving them deterministically beats relying on
+                # Qwen to remember to emit them. The vision variant has
+                # no voice ids in its prompt, so any stray Equivalence
+                # lines from a hallucinating model are also stripped (the
+                # function is a no-op when voice_entries doesn't carry
+                # main-speaker entries that match the 4 anchors).
+                semantic = _force_correct_equivalences(semantic, voice_entries
+                                                       if variant == "audio" else [])
+
+                with open(mem_path, "w") as f:
+                    json.dump({
+                        "episodic": episodic,
+                        "semantic": semantic,
+                    }, f, indent=4)
+                logger.info("[%s] wrote %s (epi=%d, sem=%d)",
+                            unit_id, mem_path, len(episodic), len(semantic))
 
 
 def main():

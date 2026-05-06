@@ -34,6 +34,12 @@ from mmagent.face_processing import (
     establish_mapping,
     filter_score_based,
 )
+from mmagent.simlife_avatars import (
+    avatar_face_info,
+    CHARACTER_NAMES,
+    FIXED_ID_TO_NAME,
+    N_FIXED,
+)
 from mmagent.simlife_voice_processing import update_videograph_from_cache
 from mmagent.memory_processing_qwen import process_memories
 from mmagent.videograph import VideoGraph
@@ -58,34 +64,71 @@ def _process_clip_faces(graph, face_path):
     graph_node_id map (process_faces alone can't surface this — its return
     value applies a top-K cap that may discard cluster_ids when several
     clusters merge into one node).
+
+    Always extends the result with identity mappings for the four avatar
+    slots ``0..3``: those graph nodes were seeded at chain start with
+    fixed ids, so any ``<face_K>`` reference (K in 0..3) — including the
+    derived ``Equivalence`` lines from precompute — resolves even when
+    that character's face doesn't visually appear in this clip.
     """
-    if not os.path.exists(face_path):
-        return {}
-    with open(face_path) as f:
-        faces_json = json.load(f)
-    if not faces_json:
-        return {}
-    tempid2faces = establish_mapping(faces_json, key="cluster_id",
-                                     filter=filter_score_based)
-    if not tempid2faces:
-        return {}
-    _, cluster_to_node = add_face_clusters_to_graph(graph, tempid2faces)
+    cluster_to_node = {}
+    if os.path.exists(face_path):
+        with open(face_path) as f:
+            faces_json = json.load(f)
+        if faces_json:
+            tempid2faces = establish_mapping(
+                faces_json, key="cluster_id", filter=filter_score_based,
+            )
+            if tempid2faces:
+                _, cluster_to_node = add_face_clusters_to_graph(graph, tempid2faces)
+
+    # Pin the four avatar slots: cluster_id K (K in 0..3) always points
+    # at graph node K (the seeded avatar). setdefault preserves whichever
+    # graph node id add_face_clusters_to_graph already chose for an
+    # actually-present cluster (typically the seeded id, since avatar
+    # cosine match is high).
+    for k in range(N_FIXED):
+        cluster_to_node.setdefault(k, k)
     return cluster_to_node
 
 
-def _build_voice_local_to_global(voice_entries, speaker_order):
-    """speaker_order is the per-clip order written at precompute time (first
-    appearance). voice_entries are the in-memory list AFTER
-    update_videograph_from_cache has populated 'matched_node' on each entry.
+def _build_voice_local_to_global(voice_entries, speaker_order=None):
+    """Build ``{local_voice_id: graph_node_id}`` for one clip.
+
+    Per-utterance convention: the i-th entry in ``voice_entries`` has
+    clip-local voice id ``i``; we map it to whichever graph voice node
+    ``update_videograph_from_cache`` matched/created for that utterance.
+    Two entries by the same speaker often share a ``matched_node``
+    (embedding cosine ≥ audio_matching_threshold), so distinct local ids
+    can map to the same graph node — that's how same-speaker references
+    coalesce in the rewritten memory text.
+
+    ``speaker_order`` is retained for backward-compat with legacy memory
+    JSONs that saved an explicit speaker positional order. When
+    provided, the i-th *speaker* in that order claims local id ``i`` and
+    we look up the first matching utterance's ``matched_node``. New
+    JSONs don't carry the field; in that case we use per-utterance ids.
+
+    ``voice_entries`` should be the in-memory list AFTER
+    ``update_videograph_from_cache`` has populated ``matched_node`` on
+    each entry.
     """
-    by_speaker = collections.defaultdict(list)
-    for entry in voice_entries:
-        by_speaker[entry.get("speaker") or "unknown"].append(entry)
     out = {}
-    for idx, spk in enumerate(speaker_order):
-        entries = by_speaker.get(spk, [])
-        if entries and "matched_node" in entries[0]:
-            out[idx] = int(entries[0]["matched_node"])
+    if speaker_order:
+        # Legacy positional convention: local id == speaker first-appearance index.
+        by_speaker = collections.defaultdict(list)
+        for entry in voice_entries:
+            by_speaker[entry.get("speaker") or "unknown"].append(entry)
+        for idx, spk in enumerate(speaker_order):
+            entries = by_speaker.get(spk, [])
+            if entries and "matched_node" in entries[0]:
+                out[idx] = int(entries[0]["matched_node"])
+        return out
+
+    # Per-utterance: i-th entry -> i.
+    for i, entry in enumerate(voice_entries):
+        if "matched_node" in entry:
+            out[i] = int(entry["matched_node"])
     return out
 
 
@@ -107,31 +150,116 @@ def _rewrite_ids(text, face_map, voice_map):
     return text
 
 
-def _resolve_clip_paths(unit_dir, override_dir, k):
-    """Return (face_path, voice_path, mem_path) for clip K.
+def _memory_filename(k, variant):
+    """Two memory variants are written by Stage A4:
+        clip_K_memory_audio.json    — Qwen with audio modality + voice JSON
+        clip_K_memory_noaudio.json  — Qwen with audio off + voices stripped
+    Legacy single-variant ``clip_K_memory.json`` is treated as the audio
+    variant for backward compat (older units precomputed before the split).
+    """
+    return f"clip_{k}_memory_{variant}.json"
 
-    Faces always come from the per-unit default (override only changes
-    audio/text). Voices and memories are an *atomic pair*: we use the
-    per-chain override only when BOTH files exist for that clip — mixing an
-    override voice JSON with the default memory JSON would break the
-    local->global voice id rewrite (speaker_order in the memory JSON
-    wouldn't match the override's actual speakers).
+
+def _resolve_clip_paths(unit_dir, override_dir, k, variant):
+    """Return (face_path, voice_path, mem_path) for clip K under ``variant``
+    (``'audio'`` or ``'noaudio'``).
+
+    Faces always come from the per-unit default (overrides only change
+    audio/text). Voices: under ``variant='audio'`` we use the per-chain
+    override pair when both override files exist (atomic pairing), else
+    fall back to defaults. Under ``variant='noaudio'`` the override flow
+    doesn't apply at all — vision-only memory ignores audio, so the
+    per-unit default voice + default noaudio memory is always used.
     """
     face_path = os.path.join(unit_dir, f"clip_{k}_faces.json")
     default_voice = os.path.join(unit_dir, f"clip_{k}_voices.json")
-    default_mem = os.path.join(unit_dir, f"clip_{k}_memory.json")
+    default_mem = os.path.join(unit_dir, _memory_filename(k, variant))
+    legacy_mem = os.path.join(unit_dir, f"clip_{k}_memory.json")
+    # Legacy fallback: if the variant-suffixed file is missing but the
+    # single-file legacy memory exists, use it (only meaningful for
+    # variant='audio').
+    if (not os.path.exists(default_mem) and variant == "audio"
+            and os.path.exists(legacy_mem)):
+        default_mem = legacy_mem
 
-    if override_dir:
+    if variant == "audio" and override_dir:
         ov_voice = os.path.join(override_dir, f"clip_{k}_voices.json")
-        ov_mem = os.path.join(override_dir, f"clip_{k}_memory.json")
+        ov_mem_var = os.path.join(override_dir, _memory_filename(k, "audio"))
+        ov_mem_legacy = os.path.join(override_dir, f"clip_{k}_memory.json")
+        ov_mem = ov_mem_var if os.path.exists(ov_mem_var) else ov_mem_legacy
         if os.path.exists(ov_voice) and os.path.exists(ov_mem):
             return face_path, ov_voice, ov_mem
     return face_path, default_voice, default_mem
 
 
-def assemble(chain_row, memory_config, inter_root="data/intermediate"):
+def _seed_avatar_face_nodes(graph):
+    """Insert one face node per available avatar BEFORE any clip is
+    processed. Because ``VideoGraph.next_node_id`` starts at 0, this fixes:
+
+        graph node 0 = Father Sim
+        graph node 1 = Mother Sim
+        graph node 2 = Son Sim
+        graph node 3 = Daughter Sim
+
+    Per-clip clusters whose unit-level ``cluster_id`` was already pinned to
+    these integers by ``recluster_unit_faces`` will then collide with the
+    seeds via ``search_img_nodes`` (cosine similarity of the avatar
+    embedding against the cluster's embedding). On match, the graph
+    *extends* the seed node; otherwise it creates a new one — typical only
+    when avatar matching at the unit-level recluster failed too, e.g. for
+    strongly off-pose detections.
+
+    Avatars whose face InsightFace couldn't detect on avatars.png are
+    skipped silently; the corresponding graph node id is then minted by
+    the first matching cluster instead, with no fixed-id guarantee for
+    that character.
+    """
+    pairs = avatar_face_info()  # [(fixed_id, name, face_info), ...]
+    if not pairs:
+        return []
+    seeded = []
+    for fixed_id, name, face_info in pairs:
+        nid = graph.add_img_node(face_info)
+        if nid != fixed_id:
+            # Should never happen on a fresh graph; log if it does because
+            # downstream assumptions break otherwise.
+            logger.warning(
+                "Avatar %s expected node id %d but got %d; downstream fixed-id "
+                "assumptions may break", name, fixed_id, nid,
+            )
+        seeded.append((nid, name))
+    logger.info("Seeded %d avatar face nodes: %s",
+                len(seeded), ", ".join(f"{nid}={n}" for nid, n in seeded))
+    return seeded
+
+
+def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="audio"):
+    """Build a VideoGraph for one chain in either ``audio`` or ``noaudio``
+    variant. The two variants share faces and voice JSONs but differ in
+    which memory text gets ingested:
+
+      audio   — ``clip_K_memory_audio.json``   (Qwen with audio modality on)
+      noaudio — ``clip_K_memory_noaudio.json`` (Qwen with audio modality off,
+                                                voice JSON stripped from prompt)
+
+    The override flow only touches the audio variant — noaudio memory
+    is identical across chains using the same unit, so it always reads
+    from the per-unit default.
+    """
     graph = VideoGraph(**memory_config)
     chain_id = chain_row.get("chain_id")
+
+    # Seed the four SimLife mains at fixed graph node ids before any clip
+    # is processed. This way <face_0..3> mean Father/Mother/Son/Daughter in
+    # every chain pickle, matching the fixed cluster_ids that
+    # recluster_unit_faces assigns.
+    _seed_avatar_face_nodes(graph)
+    # Voice nodes are NOT pre-seeded: voice ids in the prompt are
+    # per-utterance (one ``<voice_X>`` per piece of speech). Same-speaker
+    # utterances still merge into one graph voice node via cosine
+    # similarity inside ``update_videograph_from_cache``, so distinct
+    # prompt-side ``<voice_X>``s typically rewrite to the same graph
+    # node id — but the graph node ids themselves are dynamic per chain.
 
     for unit_idx, unit_id in enumerate(chain_row["video_ids"]):
         unit_dir = os.path.join(inter_root, unit_id)
@@ -150,36 +278,37 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate"):
                 override_dir = candidate
 
         for k in range(n_clips):
-            face_path, voice_path, mem_path = _resolve_clip_paths(unit_dir, override_dir, k)
+            face_path, voice_path, mem_path = _resolve_clip_paths(
+                unit_dir, override_dir, k, variant,
+            )
 
             # Faces — replay cached cluster_ids through the graph and capture
             # the local->global label map before any top-K cap clobbers it.
             face_map = _process_clip_faces(graph, face_path)
 
             # Voices — load JSON ourselves so we can read matched_node back per entry.
-            speaker_order = []
             voice_map = {}
             if os.path.exists(voice_path):
                 with open(voice_path) as f:
                     voice_entries = json.load(f)
                 if voice_entries:
                     update_videograph_from_cache(graph, voice_entries)
-                    # speaker_order is also written into the memory JSON; load that
-                    # canonical copy if present, else reconstruct.
+                    # voice_speaker_order survives in *legacy* memory JSONs
+                    # written before voice anchoring; if present, we honour
+                    # the positional convention from that era. New JSONs
+                    # don't carry the field — we derive the local-id map
+                    # from speaker names directly.
+                    legacy_order = []
                     if os.path.exists(mem_path):
                         try:
-                            speaker_order = json.load(open(mem_path)).get(
+                            legacy_order = json.load(open(mem_path)).get(
                                 "voice_speaker_order", []) or []
                         except Exception:
-                            speaker_order = []
-                    if not speaker_order:
-                        seen = []
-                        for entry in voice_entries:
-                            spk = entry.get("speaker") or "unknown"
-                            if spk not in seen:
-                                seen.append(spk)
-                        speaker_order = seen
-                    voice_map = _build_voice_local_to_global(voice_entries, speaker_order)
+                            legacy_order = []
+                    voice_map = _build_voice_local_to_global(
+                        voice_entries,
+                        speaker_order=legacy_order if legacy_order else None,
+                    )
 
             # Memory — rewrite ids, then process via existing pipeline.
             if not os.path.exists(mem_path):
@@ -200,6 +329,15 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate"):
     return graph
 
 
+def _variant_pkl_path(base_mem_path, variant):
+    """For ``data/memory_graphs/vc_NNN.pkl`` and variant ``noaudio`` return
+    ``data/memory_graphs/vc_NNN_noaudio.pkl``; ``audio`` likewise. Always
+    suffixes so the two variants never share a path."""
+    if base_mem_path.endswith(".pkl"):
+        return f"{base_mem_path[:-4]}_{variant}.pkl"
+    return f"{base_mem_path}_{variant}.pkl"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--chain", help="chain_id basename, e.g. vc_000001")
@@ -208,6 +346,11 @@ def main():
     parser.add_argument("--memory_config", default="configs/memory_config.json")
     parser.add_argument("--log_level", default="INFO")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--variant", choices=["audio", "noaudio", "both"],
+                        default="both",
+                        help="Which memory variant to build. Default builds "
+                             "both audio (vc_NNN_audio.pkl) and noaudio "
+                             "(vc_NNN_noaudio.pkl) graphs.")
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper()),
@@ -225,19 +368,22 @@ def main():
     if chain_row is None:
         raise SystemExit(f"Chain {args.chain!r} not found in {args.data_chains}")
 
-    out_path = chain_row["mem_path"]
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    if os.path.exists(out_path) and not args.overwrite:
-        logger.info("Already exists: %s (use --overwrite to rebuild)", out_path)
-        return
+    base_mem_path = chain_row["mem_path"]
+    os.makedirs(os.path.dirname(base_mem_path), exist_ok=True)
 
-    graph = assemble(chain_row, memory_config, inter_root=args.inter_root)
-
-    with open(out_path, "wb") as f:
-        pickle.dump(graph, f)
-    logger.info("wrote %s (nodes=%d edges=%d characters=%d)",
-                out_path, len(graph.nodes), len(graph.edges),
-                len(getattr(graph, "character_mappings", {})))
+    variants = ["audio", "noaudio"] if args.variant == "both" else [args.variant]
+    for variant in variants:
+        out_path = _variant_pkl_path(base_mem_path, variant)
+        if os.path.exists(out_path) and not args.overwrite:
+            logger.info("Already exists: %s (use --overwrite to rebuild)", out_path)
+            continue
+        graph = assemble(chain_row, memory_config, inter_root=args.inter_root,
+                         variant=variant)
+        with open(out_path, "wb") as f:
+            pickle.dump(graph, f)
+        logger.info("wrote %s (variant=%s nodes=%d edges=%d characters=%d)",
+                    out_path, variant, len(graph.nodes), len(graph.edges),
+                    len(getattr(graph, "character_mappings", {})))
 
 
 if __name__ == "__main__":
