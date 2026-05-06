@@ -28,9 +28,9 @@
 
 source /home/daiyp/.bashrc
 cd /home/daiyp/m3-agent
+micromamba activate m3a 
 
 REGENERATE_MEMORIES="${REGENERATE_MEMORIES:-1}"
-PY=/nfs/turbo/coe-chaijy/daiyp/micromamba_gl/envs/m3a/bin/python
 
 # Build a sorted list of override-chain ids on the fly so we don't need a
 # separate manifest file.
@@ -49,5 +49,5 @@ if [[ "$REGENERATE_MEMORIES" == "1" ]]; then
 fi
 
 echo "[$(date)] task=$SLURM_ARRAY_TASK_ID chain=$CHAIN regen_memories=$REGENERATE_MEMORIES host=$(hostname)"
-"$PY" m3_agent/simlife_apply_dialogue_overrides.py --chain "$CHAIN" "${EXTRA[@]}"
+python m3_agent/simlife_apply_dialogue_overrides.py --chain "$CHAIN" "${EXTRA[@]}"
 echo "[$(date)] done $CHAIN"

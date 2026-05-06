@@ -21,12 +21,13 @@
 #     the 12 h limit.
 #   - For a quicker run, raise NUM_SHARDS to 16 or 25 (one chain per shard).
 
-set -eo pipefail
-cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source /home/daiyp/.bashrc
+cd /home/daiyp/m3-agent
+
+micromamba activate m3a 
 
 NUM_SHARDS="${NUM_SHARDS:-8}"
 DATA_FILE="${DATA_FILE:-data/annotations/simlife.json}"
-PY=/data/daiyp/micromamba/envs/m3a/bin/python
 
 if [[ "$SLURM_ARRAY_TASK_ID" -ge "$NUM_SHARDS" ]]; then
     echo "shard $SLURM_ARRAY_TASK_ID >= NUM_SHARDS=$NUM_SHARDS, nothing to do"
@@ -34,7 +35,7 @@ if [[ "$SLURM_ARRAY_TASK_ID" -ge "$NUM_SHARDS" ]]; then
 fi
 
 echo "[$(date)] shard=$SLURM_ARRAY_TASK_ID/$NUM_SHARDS data=$DATA_FILE host=$(hostname)"
-"$PY" m3_agent/control.py \
+python m3_agent/control.py \
     --data_file "$DATA_FILE" \
     --num_shards "$NUM_SHARDS" \
     --shard "$SLURM_ARRAY_TASK_ID" \

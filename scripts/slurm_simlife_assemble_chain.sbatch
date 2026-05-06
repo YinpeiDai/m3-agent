@@ -11,14 +11,15 @@
 # One job per unique video_chain_id. Array length must match
 # `wc -l data/simlife/data_chains.jsonl` (default 0-49 for the current 50 chains).
 
-set -eo pipefail
-cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source /home/daiyp/.bashrc
+cd /home/daiyp/m3-agent
+
+micromamba activate m3a 
 
 CHAINS_FILE=data/simlife/data_chains.jsonl
-PY=/data/daiyp/micromamba/envs/m3a/bin/python
 
 LINE=$((SLURM_ARRAY_TASK_ID + 1))
-CHAIN=$(sed -n "${LINE}p" "$CHAINS_FILE" | "$PY" -c 'import sys, json; print(json.loads(sys.stdin.read())["chain_id"])')
+CHAIN=$(sed -n "${LINE}p" "$CHAINS_FILE" | python -c 'import sys, json; print(json.loads(sys.stdin.read())["chain_id"])')
 if [[ -z "$CHAIN" ]]; then
     echo "No chain at line $LINE of $CHAINS_FILE"
     exit 1
@@ -28,5 +29,5 @@ echo "[$(date)] task=$SLURM_ARRAY_TASK_ID chain=$CHAIN host=$(hostname)"
 # Build both memory-graph variants by default (audio + vision). Override with
 # VARIANT=audio or VARIANT=vision before sbatch to build only one.
 VARIANT="${VARIANT:-both}"
-"$PY" m3_agent/simlife_assemble_chain.py --chain "$CHAIN" --variant "$VARIANT"
+python m3_agent/simlife_assemble_chain.py --chain "$CHAIN" --variant "$VARIANT"
 echo "[$(date)] done $CHAIN ($VARIANT)"
