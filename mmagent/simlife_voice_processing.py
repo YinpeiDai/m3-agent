@@ -1,9 +1,21 @@
 """SimLife voice processing.
 
 Replaces the Gemini-based diarization in mmagent/voice_processing.py with a
-log.jsonl + dialogue_audio/*.wav driven flow. Output JSON is bit-compatible
-with the existing pipeline so stage-B graph assembly can reuse the same
+``dialogue/sessions.json``-driven flow. Output JSON is bit-compatible with
+the existing pipeline so stage-B graph assembly can reuse the same
 update_videograph logic.
+
+Two source formats are supported transparently:
+
+  - ``video_units/<u>/dialogue/sessions.json``   — per-unit defaults
+  - ``video_chains/<vc>/overlay/<u>/dialogue/sessions.json`` — per-chain
+    overrides (every session listed, with ``is_overridden`` + ``audio_path``
+    per session pointing into either the overlay dir or the unit dir).
+
+Each session entry's ``audio_path`` is the authoritative WAV pointer (an
+overridden session's path lives under the overlay dir, otherwise it points
+back at ``video_units/<u>/dialogue/<sid>.wav``). The legacy log.jsonl-based
+path is retained only for backward compat with already-generated caches.
 
 Also exposes ``process_voices_from_cache`` for stage-B: it bypasses the
 ``if not base64_audio: return {}`` short-circuit at the top of
@@ -64,12 +76,11 @@ def _slice_to_wav_bytes(audio_segment, start_ms, end_ms):
 
 
 def load_dialogue_events(log_path):
-    """Read every ``type==dialogue`` row from a log.jsonl-shaped file.
+    """Legacy reader: every ``type==dialogue`` row from a log.jsonl-shaped file.
 
-    Used by both the per-unit pipeline (``video_units/<u>/log.jsonl``) and
-    the per-chain override script
-    (``task_dialogue_audio/<vc>/<u>/asr.jsonl``), which share this schema.
-    Returns a list (not a generator) so callers can splice/replace events.
+    Kept for backward compatibility with caches generated before the switch
+    to ``dialogue/sessions.json``. New code paths should call
+    :func:`load_sessions` instead. Returns a list so callers can splice.
     """
     events = []
     if not os.path.exists(log_path):
@@ -86,8 +97,95 @@ def load_dialogue_events(log_path):
     return events
 
 
+def load_sessions(sessions_json_path):
+    """Load a ``dialogue/sessions.json`` file (per-unit default OR per-chain
+    overlay) and return its ``sessions`` list.
+
+    Returns an empty list when the file is absent — the caller treats that
+    as "no dialogue for this unit" rather than an error so missing dialogue
+    folders don't break the precompute pipeline for action-only days.
+    """
+    if not os.path.exists(sessions_json_path):
+        return []
+    with open(sessions_json_path) as f:
+        return json.load(f).get("sessions") or []
+
+
+def iter_utterances_from_sessions(sessions):
+    """Flatten ``dialogue/sessions.json`` sessions into per-utterance dicts.
+
+    The output dict shape matches :func:`iter_utterances` so downstream
+    consumers (``build_voice_jsons``) don't need to know which source
+    format was loaded.
+
+    Sessions JSON differs from log.jsonl rows in:
+      - ``start_time``       -> ``start_time_sec``
+      - ``utterances``       -> ``transcript``
+      - ``audio_path`` is now per-session (relative path string)
+
+    Per-session ``audio_path`` is propagated to every yielded utterance so
+    the audio resolver in ``build_voice_jsons`` can route to the right WAV
+    directly (no separate session->path map needed). Overridden sessions
+    in an overlay file naturally point into the overlay dir; non-overridden
+    ones point back at the unit's default WAV.
+    """
+    for sess in sessions:
+        session_id = sess.get("session_id")
+        # tolerate legacy log.jsonl-style start_time too
+        sess_start = float(sess.get("start_time_sec", sess.get("start_time", 0.0)))
+        audio_rel = sess.get("audio_path")
+        for utt in sess.get("transcript", sess.get("utterances", [])):
+            offset = float(utt.get("start_offset_sec", 0.0))
+            duration = float(utt.get("duration_sec", 0.0))
+            if duration <= 0:
+                continue
+            abs_start = sess_start + offset
+            abs_end = abs_start + duration
+            yield {
+                "session_id": session_id,
+                "session_offset_sec": offset,
+                "duration_sec": duration,
+                "abs_start_sec": abs_start,
+                "abs_end_sec": abs_end,
+                "speaker": utt.get("speaker"),
+                "text": utt.get("text", ""),
+                # Path is relative to the SimLife-Data-HF root (e.g.
+                # "video_units/video_001128/dialogue/session_001.wav" or
+                # "video_chains/vc_000001/overlay/.../session_005.wav").
+                # Caller resolves to an absolute path.
+                "audio_rel_path": audio_rel,
+            }
+
+
+def sessions_to_legacy_events(sessions):
+    """Convert a ``dialogue/sessions.json`` session list into the
+    log.jsonl-row shape the audio mixer (and any other legacy consumer)
+    expects.
+
+    The resulting rows are NOT written to disk — they're a thin in-memory
+    adapter so we don't have to teach every consumer two formats.
+    """
+    out = []
+    for s in sessions:
+        out.append({
+            "type": "dialogue",
+            "session_id": s.get("session_id"),
+            "start_time": float(s.get("start_time_sec", s.get("start_time", 0.0))),
+            "end_time": float(s.get("end_time_sec", s.get("end_time", 0.0))),
+            "participants": list(s.get("participants") or []),
+            "utterances": list(s.get("transcript", s.get("utterances", []))),
+            # carry through so per-row resolvers can use it if they want
+            "audio_path": s.get("audio_path"),
+        })
+    return out
+
+
 def iter_utterances(events):
-    """Flatten dialogue events to per-utterance dicts in absolute (unit-local) time."""
+    """Legacy: flatten log.jsonl-shaped dialogue events to per-utterance dicts.
+
+    Kept for backward compat with the override script's old code paths.
+    New code should use :func:`iter_utterances_from_sessions`.
+    """
     for row in events:
         session_id = row.get("session_id")
         dialogue_start = float(row["start_time"])
@@ -109,20 +207,26 @@ def iter_utterances(events):
             }
 
 
-def build_voice_jsons(events, audio_resolver, out_dir, n_clips,
+def build_voice_jsons(utterances_or_events, audio_resolver, out_dir, n_clips,
                       clip_interval_sec=CLIP_INTERVAL_SEC, min_duration_sec=2,
-                      overwrite=False, log_label="", only_clips=None):
+                      overwrite=False, log_label="", only_clips=None,
+                      utterances=None):
     """Generic per-clip voice-JSON writer.
 
-    Used by the default per-unit precompute (with log.jsonl + dialogue_audio)
-    and by the per-chain override flow (with possibly merged events and
-    override session WAVs). All slicing/embedding/format choices live here so
-    both paths emit byte-compatible JSON for stage-B consumers.
-
     Args:
-        events: list of dialogue-event dicts (same shape as log.jsonl rows).
-        audio_resolver: callable ``session_id -> path-to-wav`` (or ``None``).
-            Lets callers prefer override WAVs and fall back to defaults.
+        utterances_or_events: legacy positional — when ``utterances`` is
+            None this is treated as a list of log.jsonl-shaped dialogue
+            events and flattened via :func:`iter_utterances`. New callers
+            should pass ``utterances=`` instead and leave this empty.
+        utterances: explicit pre-flattened utterance iterable (each dict
+            shaped like :func:`iter_utterances_from_sessions` output).
+            Recommended path for new sessions.json-driven callers.
+        audio_resolver: callable ``utt_dict -> path-to-wav`` (or ``None``).
+            Receives the full utterance dict so resolvers can use the
+            per-session ``audio_rel_path`` for sessions.json sources, or
+            fall back to ``session_id``-based lookup for log.jsonl
+            sources. For backward compat, a callable that accepts a
+            single ``session_id`` string is also detected and adapted.
         out_dir: writes ``clip_K_voices.json`` for K in [0, n_clips).
         n_clips: total number of 30s clips for this unit.
         overwrite: if False, leave existing per-clip JSONs untouched.
@@ -137,11 +241,27 @@ def build_voice_jsons(events, audio_resolver, out_dir, n_clips,
     """
     os.makedirs(out_dir, exist_ok=True)
 
+    if utterances is None:
+        utterances = iter_utterances(utterances_or_events)
+
+    # Detect legacy session_id-only resolvers and adapt them so the rest of
+    # the function can pass full utterance dicts unconditionally.
+    resolver = audio_resolver
+    try:
+        import inspect
+        sig = inspect.signature(audio_resolver)
+        if len(sig.parameters) == 1:
+            first = next(iter(sig.parameters))
+            if first in ("session_id", "sid"):
+                resolver = lambda utt, _orig=audio_resolver: _orig(utt["session_id"])
+    except (TypeError, ValueError):
+        pass
+
     write_set = None if only_clips is None else set(only_clips)
 
     buckets = {k: [] for k in range(n_clips)}
     skipped_short = 0
-    for utt in iter_utterances(events):
+    for utt in utterances:
         if utt["duration_sec"] < min_duration_sec:
             skipped_short += 1
             continue
@@ -152,18 +272,22 @@ def build_voice_jsons(events, audio_resolver, out_dir, n_clips,
     if skipped_short:
         logger.debug("[%s] skipped %d utterances < %ds", log_label, skipped_short, min_duration_sec)
 
-    # Cache loaded session WAVs (one resolver call per session, decoded once).
-    session_cache = {}
+    # Cache loaded WAVs by resolved absolute path so two utterances from
+    # the same session decode the WAV exactly once even if the resolver
+    # routes them through different code paths.
+    seg_cache = {}
 
-    def _get_segment(session_id):
-        if session_id in session_cache:
-            return session_cache[session_id]
-        wav_path = audio_resolver(session_id)
-        if not wav_path or not os.path.exists(wav_path):
-            session_cache[session_id] = None
+    def _get_segment(utt):
+        wav_path = resolver(utt)
+        if not wav_path:
+            return None
+        if wav_path in seg_cache:
+            return seg_cache[wav_path]
+        if not os.path.exists(wav_path):
+            seg_cache[wav_path] = None
             return None
         seg = AudioSegment.from_wav(wav_path)
-        session_cache[session_id] = seg
+        seg_cache[wav_path] = seg
         return seg
 
     for k in range(n_clips):
@@ -177,7 +301,7 @@ def build_voice_jsons(events, audio_resolver, out_dir, n_clips,
         clip_start_abs = k * clip_interval_sec
         entries = []
         for utt in buckets[k]:
-            seg = _get_segment(utt["session_id"])
+            seg = _get_segment(utt)
             if seg is None:
                 logger.warning("[%s] missing wav for session %s", log_label, utt["session_id"])
                 continue
@@ -211,29 +335,66 @@ def build_voice_jsons(events, audio_resolver, out_dir, n_clips,
 
 
 def build_unit_voice_jsons(unit_dir, out_dir, n_clips, clip_interval_sec=CLIP_INTERVAL_SEC,
-                          min_duration_sec=2, overwrite=False):
-    """Default per-unit pipeline: read log.jsonl + dialogue_audio/<sid>.wav.
+                          min_duration_sec=2, overwrite=False,
+                          simlife_root="SimLife-Data-HF"):
+    """Default per-unit pipeline.
 
-    Empty units (no log.jsonl) still get empty per-clip JSONs so the absence
-    is distinguishable from "not yet processed."
+    Source preference:
+      1. ``<unit_dir>/dialogue/sessions.json`` — current SimLife layout.
+         Each session lists its own ``audio_path`` (relative to
+         ``simlife_root``), so the resolver simply joins that.
+      2. ``<unit_dir>/log.jsonl`` (legacy) — falls back to the old
+         ``dialogue_audio/<sid>.wav`` convention.
+
+    Empty units (no dialogue source) still get empty per-clip JSONs so
+    the absence is distinguishable from "not yet processed."
     """
+    label = os.path.basename(unit_dir.rstrip("/"))
+    sessions_path = os.path.join(unit_dir, "dialogue", "sessions.json")
     log_path = os.path.join(unit_dir, "log.jsonl")
+
+    if os.path.exists(sessions_path):
+        sessions = load_sessions(sessions_path)
+        utts = iter_utterances_from_sessions(sessions)
+
+        # ``audio_path`` in sessions.json is relative to the SimLife dataset
+        # root. Defensive default: when missing, fall back to the canonical
+        # per-unit dialogue dir convention.
+        unit_id = label
+        default_dialogue_dir = os.path.join(unit_dir, "dialogue")
+
+        def audio_resolver(utt):
+            rel = utt.get("audio_rel_path")
+            if rel:
+                return os.path.join(simlife_root, rel)
+            sid = utt.get("session_id")
+            return os.path.join(default_dialogue_dir, f"{sid}.wav") if sid else None
+
+        build_voice_jsons(
+            None, audio_resolver, out_dir, n_clips,
+            clip_interval_sec=clip_interval_sec,
+            min_duration_sec=min_duration_sec,
+            overwrite=overwrite, log_label=label,
+            utterances=utts,
+        )
+        return
+
     if not os.path.exists(log_path):
-        logger.warning("No log.jsonl at %s; writing empty voice JSONs.", log_path)
+        logger.warning("No dialogue/sessions.json or log.jsonl at %s; "
+                       "writing empty voice JSONs.", unit_dir)
         os.makedirs(out_dir, exist_ok=True)
         for k in range(n_clips):
             with open(os.path.join(out_dir, f"clip_{k}_voices.json"), "w") as f:
                 json.dump([], f)
         return
 
+    # Legacy fallback path.
     events = load_dialogue_events(log_path)
-
     audio_dir = os.path.join(unit_dir, "dialogue_audio")
 
     def audio_resolver(session_id):
         return os.path.join(audio_dir, f"{session_id}.wav")
 
-    label = os.path.basename(unit_dir.rstrip("/"))
     build_voice_jsons(events, audio_resolver, out_dir, n_clips,
                       clip_interval_sec=clip_interval_sec,
                       min_duration_sec=min_duration_sec,

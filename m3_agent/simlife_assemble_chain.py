@@ -223,6 +223,37 @@ def _resolve_clip_paths(unit_dir, override_dir, k, variant):
     return face_path, default_voice, default_mem
 
 
+def _format_calendar_prefix(date, dow):
+    """Render the per-clip calendar prefix prepended to every memory text.
+
+    Returns an empty string when both fields are missing — the caller then
+    skips both the prefix injection and the per-node metadata stamping,
+    so chains without a ``day_calendar`` (e.g., legacy data) are
+    unaffected.
+    """
+    if not date and not dow:
+        return ""
+    if date and dow:
+        return f"[{date}, {dow}] "
+    return f"[{date or dow}] "
+
+
+def _stamp_calendar_metadata(graph, new_node_ids, date, dow, day_position):
+    """Stamp ``date`` / ``day_of_week`` / ``day_position`` on freshly added
+    text-node metadata so downstream code can filter/rank by calendar
+    without re-parsing the prefix out of the text."""
+    for nid in new_node_ids:
+        node = graph.nodes.get(nid)
+        if node is None:
+            continue
+        if date:
+            node.metadata['date'] = date
+        if dow:
+            node.metadata['day_of_week'] = dow
+        if day_position is not None:
+            node.metadata['day_position'] = day_position
+
+
 def _seed_avatar_face_nodes(graph):
     """Insert one face node per available avatar BEFORE any clip is
     processed. Because ``VideoGraph.next_node_id`` starts at 0, this fixes:
@@ -280,6 +311,15 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="
     graph = VideoGraph(**memory_config)
     chain_id = chain_row.get("chain_id") or "?"
 
+    # Per-unit calendar lookup. The chain manifest carries day_calendar
+    # entries copied straight from chain.json; we inject [YYYY-MM-DD,
+    # DayOfWeek] into every memory text per unit AND stamp the same fields
+    # on each text node's metadata. SimLife questions about weekday-based
+    # phenomena ("does Father Sim run on Mondays?") rely on this.
+    calendar_by_unit = {}
+    for entry in (chain_row.get("day_calendar") or []):
+        calendar_by_unit[entry.get("video_id")] = entry
+
     # Pre-scan the chain so the progress bar has a real total and we can
     # warn about missing units up-front instead of mid-iteration.
     units_to_process = []
@@ -295,8 +335,9 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="
             continue
         units_to_process.append((unit_id, unit_dir, n))
         total_clips += n
-    logger.info("[%s] %s variant: %d units, %d clips total",
-                chain_id, variant, len(units_to_process), total_clips)
+    logger.info("[%s] %s variant: %d units, %d clips total (calendar entries: %d)",
+                chain_id, variant, len(units_to_process), total_clips,
+                len(calendar_by_unit))
 
     # Seed the four SimLife mains at fixed graph node ids before any clip
     # is processed. This way <face_0..3> mean Father/Mother/Son/Daughter in
@@ -321,6 +362,12 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="
             candidate = os.path.join(inter_root, "per_chain", chain_id, unit_id)
             if os.path.isdir(candidate):
                 override_dir = candidate
+
+        cal = calendar_by_unit.get(unit_id) or {}
+        cal_date = cal.get("date")
+        cal_dow = cal.get("day_of_week")
+        cal_day_pos = cal.get("day_position")
+        cal_prefix = _format_calendar_prefix(cal_date, cal_dow)
 
         unit_t0 = time.time()
         unit_start_nodes = len(graph.nodes)
@@ -371,20 +418,39 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="
             mem = json.load(open(mem_path))
             episodic_raw = mem.get("episodic", []) or []
             semantic_raw = mem.get("semantic", []) or []
+            # When we have a calendar prefix, the cached embeddings (computed
+            # on date-less Stage A text) no longer match the rewritten
+            # text; drop them so process_memories re-embeds against the
+            # date-prefixed line. Without a prefix, keep the cache.
+            cached_epi = None if cal_prefix else mem.get("episodic_embeddings")
+            cached_sem = None if cal_prefix else mem.get("semantic_embeddings")
             episodic, epi_embs = _filter_and_rewrite(
-                episodic_raw, mem.get("episodic_embeddings"), face_map, voice_map,
+                episodic_raw, cached_epi, face_map, voice_map,
             )
             semantic, sem_embs = _filter_and_rewrite(
-                semantic_raw, mem.get("semantic_embeddings"), face_map, voice_map,
+                semantic_raw, cached_sem, face_map, voice_map,
             )
+            if cal_prefix:
+                episodic = [cal_prefix + t for t in episodic]
+                semantic = [cal_prefix + t for t in semantic]
 
             clip_id = unit_idx * CLIPS_PER_UNIT_OFFSET + k
+
+            # Track new text nodes per call so we can stamp calendar
+            # metadata on exactly the ones this clip just produced.
+            before_clip_nodes = set(graph.text_nodes_by_clip.get(clip_id, []))
             if episodic:
                 process_memories(graph, episodic, clip_id,
                                  type="episodic", embeddings=epi_embs)
             if semantic:
                 process_memories(graph, semantic, clip_id,
                                  type="semantic", embeddings=sem_embs)
+            if cal_date or cal_dow or cal_day_pos is not None:
+                after_clip_nodes = set(graph.text_nodes_by_clip.get(clip_id, []))
+                _stamp_calendar_metadata(
+                    graph, after_clip_nodes - before_clip_nodes,
+                    cal_date, cal_dow, cal_day_pos,
+                )
 
             pbar.update(1)
             pbar.set_postfix(

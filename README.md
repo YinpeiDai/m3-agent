@@ -198,11 +198,12 @@ python m3_agent/simlife_data_prep.py
 # 2) Per-unit precomputation (heavy; SLURM array, one job per video unit)
 sbatch scripts/slurm_simlife_precompute_unit.sbatch
 # or locally for one unit:
-python m3_agent/simlife_precompute_unit.py --unit video_001285
+python m3_agent/simlife_precompute_unit.py --unit video_001289
 
-# 2b) Per-chain dialogue overrides (only chains under task_dialogue_audio/).
-#     Default re-runs Qwen for clips whose voices changed; Stage B requires
-#     matching voice+memory pair to use the override.
+# 2b) Per-chain dialogue overrides (only chains with an overlay/ subdir under
+#     SimLife-Data-HF/video_chains/<vc>/). Default re-runs Qwen for clips
+#     whose voices changed; Stage B requires the matching voice+memory pair
+#     to use the override.
 sbatch scripts/slurm_simlife_apply_overrides.sbatch
 # or locally for one chain:
 python m3_agent/simlife_apply_dialogue_overrides.py --chain vc_000001 --regenerate_memories

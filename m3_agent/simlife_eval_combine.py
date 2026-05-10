@@ -2,12 +2,14 @@
 
 Reads ``data/results/<dataset>.shard*.jsonl`` and writes the concatenated
 results to ``data/results/<dataset>.jsonl`` plus a one-line summary with
-overall accuracy. Safe to re-run; existing combined file is overwritten.
+per-variant/per-hint counts. No correctness scoring here — control.py
+collects raw answers; grading happens in a downstream evaluator.
 
-Each shard line is a single JSON object emitted by ``control.py``; we merge
-without deduplication beyond ``question_id``. If the same ``question_id``
-appears in multiple shards (shouldn't happen given mem_path-based sharding),
-the last one wins.
+Each shard line is a single JSON object emitted by ``control.py``. Rows
+are deduped by ``(question_id, variant, hint)`` so that running the same
+question under different hint levels keeps all rows. If the same key
+appears in multiple shards (shouldn't happen given chain-based
+sharding), the last one wins.
 """
 import argparse
 import glob
@@ -55,9 +57,9 @@ def main():
     out_path = args.out_path or os.path.join(args.results_dir, f"{args.dataset}.jsonl")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    # Key by (id, variant) so the same question evaluated under both
-    # audio + noaudio keeps both rows; legacy single-variant entries
-    # without a 'variant' field land under variant=''.
+    # Key by (id, variant, hint) so the same question evaluated under
+    # different hint levels keeps all rows. Legacy entries without
+    # variant/hint land under sentinel keys.
     by_key = {}
     for p in shard_paths:
         with open(p) as f:
@@ -67,30 +69,29 @@ def main():
                     continue
                 row = json.loads(line)
                 qid = row.get("id") or row.get("question_id")
-                variant = row.get("variant", "")
-                by_key[(qid, variant)] = row
+                key = (qid, row.get("variant", ""), row.get("hint", ""))
+                by_key[key] = row
 
-    by_variant = {}  # variant -> [total, correct]
-    for (qid, variant), r in by_key.items():
-        bucket = by_variant.setdefault(variant or "?", [0, 0])
-        bucket[0] += 1
-        if r.get("gpt_eval"):
-            bucket[1] += 1
-    n_total = sum(b[0] for b in by_variant.values())
-    n_correct = sum(b[1] for b in by_variant.values())
+    by_variant = {}
+    by_hint = {}
+    for (_qid, variant, hint), _r in by_key.items():
+        by_variant[variant or "?"] = by_variant.get(variant or "?", 0) + 1
+        by_hint[hint or "?"] = by_hint.get(hint or "?", 0) + 1
+    n_total = len(by_key)
 
     with open(out_path, "w") as f:
         for key in sorted(by_key.keys()):
             f.write(json.dumps(by_key[key], ensure_ascii=False) + "\n")
 
-    overall_acc = (n_correct / n_total) if n_total else 0.0
-    print(f"shards={len(shard_paths)} entries={n_total} correct={n_correct} "
-          f"accuracy={overall_acc:.4f}")
+    print(f"shards={len(shard_paths)} entries={n_total}")
     for variant in sorted(by_variant):
-        t, c = by_variant[variant]
-        acc = (c / t) if t else 0.0
         label = variant or "(no variant tag)"
-        print(f"  variant={label:18s} entries={t:6d} correct={c:6d} accuracy={acc:.4f}")
+        print(f"  variant={label:18s} entries={by_variant[variant]:6d}")
+    for hint in ("no_hint", "partial_hint", "full_hint"):
+        if hint in by_hint:
+            print(f"  hint={hint:14s} entries={by_hint[hint]:6d}")
+    for hint in sorted(set(by_hint) - {"no_hint", "partial_hint", "full_hint"}):
+        print(f"  hint={hint:14s} entries={by_hint[hint]:6d}")
     print(f"  wrote {out_path}")
     if missing:
         print(f"  WARNING: missing shards {missing} (re-run those then re-combine)")

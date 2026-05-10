@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=sl-ovr
-#SBATCH --array=0-69%12
+#SBATCH --array=0-82%12
 #SBATCH --account=chaijy2
 #SBATCH --partition=spgpu
 #SBATCH --gres=gpu:1
@@ -12,18 +12,21 @@
 #SBATCH --output=m3_agent_outputs/simlife_logs/apply_overrides_%A_%a.log
 
 # Stage A.5: apply per-chain dialogue overrides on top of the default per-unit
-# intermediate JSONs. Walks SimLife-Data-HF/task_dialogue_audio/ for chains with
-# replacement WAVs + asr.jsonl, and writes per-(chain, unit) voice JSONs to
-# data/intermediate/per_chain/<chain>/<unit>/. With REGENERATE_MEMORIES=1 it
-# also re-runs Qwen2.5-Omni for clips whose voices changed (this is what makes
-# the override actually take effect at Stage B — see the atomic pairing rule
-# in m3_agent/simlife_apply_dialogue_overrides.py).
+# intermediate JSONs. Walks SimLife-Data-HF/video_chains/<vc>/overlay/ for
+# chains that ship a per-chain dialogue override and writes per-(chain, unit)
+# voice JSONs to data/intermediate/per_chain/<chain>/<unit>/. With
+# REGENERATE_MEMORIES=1 it also re-runs Qwen2.5-Omni for clips whose voices
+# changed (required for the override to actually take effect at Stage B —
+# see the atomic pairing rule in m3_agent/simlife_apply_dialogue_overrides.py).
 #
 # Run AFTER Stage A precompute for the affected units (the script reads the
 # precomputed face JSONs to determine n_clips per unit).
 #
-# Tune --array to ``ls SimLife-Data-HF/task_dialogue_audio | wc -l`` (default
-# 0-69 for the current 70 chains).
+# Tune --array to match the count of overlay chains:
+#   ls SimLife-Data-HF/video_chains | while read d; do
+#     [[ -d SimLife-Data-HF/video_chains/$d/overlay ]] && echo "$d"
+#   done | wc -l
+# (currently 83 — array 0-82).
 
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
@@ -36,12 +39,11 @@ micromamba activate m3a
 
 REGENERATE_MEMORIES="${REGENERATE_MEMORIES:-1}"
 
-# Build a sorted list of override-chain ids on the fly so we don't need a
-# separate manifest file.
-CHAIN=$(ls SimLife-Data-HF/task_dialogue_audio 2>/dev/null \
-        | grep '^vc_' \
-        | sort \
-        | sed -n "$((SLURM_ARRAY_TASK_ID + 1))p")
+# Build a sorted list of override-chain ids on the fly (chains with an
+# overlay/ subdir under video_chains/) so we don't need a separate manifest.
+CHAIN=$(for d in SimLife-Data-HF/video_chains/vc_*; do
+            [[ -d "$d/overlay" ]] && basename "$d"
+        done | sort | sed -n "$((SLURM_ARRAY_TASK_ID + 1))p")
 if [[ -z "$CHAIN" ]]; then
     echo "No chain at array index $SLURM_ARRAY_TASK_ID"
     exit 0

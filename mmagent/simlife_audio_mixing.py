@@ -19,9 +19,10 @@ need an embedded audio track. We do this in two steps:
    muxes that WAV with video.mp4 in a single ffmpeg pass.
 
 The override flow reuses (1) with a custom ``audio_resolver`` that returns
-override WAVs from ``task_dialogue_audio/<chain>/<unit>/<session>.wav``
-when present, so the same code path produces per-chain clip MP4s with
-the swapped dialogue.
+override WAVs from ``video_chains/<vc>/overlay/<unit>/dialogue/<session>.wav``
+when present (per the per-session ``audio_path`` field in the overlay's
+``sessions.json``), so the same code path produces per-chain clip MP4s
+with the swapped dialogue.
 """
 import logging
 import os

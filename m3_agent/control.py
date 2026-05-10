@@ -36,15 +36,12 @@ import re
 import sys
 import time
 
-import openai
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 import mmagent.videograph
-from mmagent.prompts import prompt_agent_verify_answer_referencing
 from mmagent.retrieve import search
-from mmagent.utils.chat_api import generate_messages
 from mmagent.utils.general import load_video_graph
 
 # load_video_graph unpickles a VideoGraph that was originally pickled
@@ -56,16 +53,8 @@ sys.modules["videograph"] = mmagent.videograph
 # Module config + globals
 # ---------------------------------------------------------------------------
 processing_config = json.load(open("configs/processing_config.json"))
-api_config = json.load(open("configs/api_config.json"))
 
 MODEL_NAME = "models/M3-Agent-Control"
-GPT_MODEL = "gpt-4-0125-preview"
-
-_gpt_client = openai.AzureOpenAI(
-    azure_endpoint=api_config[GPT_MODEL]["azure_endpoint"],
-    api_version=api_config[GPT_MODEL]["api_version"],
-    api_key=api_config[GPT_MODEL]["api_key"],
-)
 
 SYSTEM_PROMPT = (
     "You are given a question and some relevant knowledge. Your task is to reason "
@@ -74,6 +63,25 @@ SYSTEM_PROMPT = (
     "sufficient, output [Search] and generate a query that will be encoded into "
     "embeddings for a vector similarity search. The query will help retrieve "
     "additional information from a memory bank.\n\nQuestion: {question}"
+)
+
+# When the annotation file is a SimLife dataset, every chain pickle is built
+# with the four mains pinned to fixed face / character ids by the avatar
+# anchoring + deterministic refresh_equivalences. We can short-circuit the
+# usual "search for character id of NAME" exploration round by telling the
+# model up-front. Append (not overwrite) so the original instructions still
+# apply to anyone outside the four mains.
+SIMLIFE_CHARACTER_HINT = (
+    "\n\nNote: current task follows a *fixed* character-ID convention "
+    "across every chain — you do NOT need to look up the mapping for the four "
+    "main characters; they are pre-assigned:\n"
+    "  <character_0> = Father Sim\n"
+    "  <character_1> = Mother Sim\n"
+    "  <character_2> = Son Sim\n"
+    "  <character_3> = Daughter Sim\n"
+    "Use these character IDs directly in your search queries when the question "
+    "concerns one of them, and skip the name-lookup search step. All SimLife "
+    "questions are about these four characters."
 )
 INSTRUCTION = (
     "\n\nOutput the answer in the format:\n"
@@ -103,7 +111,7 @@ sampling_params = SamplingParams(
 
 
 # ---------------------------------------------------------------------------
-# CPU-affinity / GPT-4 verifier helpers
+# CPU-affinity helper
 # ---------------------------------------------------------------------------
 def _detect_usable_cpus():
     """Return the number of CPUs this process is *actually allowed* to use.
@@ -125,45 +133,6 @@ def _detect_usable_cpus():
         return max(1, len(os.sched_getaffinity(0)))
     except (AttributeError, OSError):
         return max(1, os.cpu_count() or 1)
-
-
-def _gpt_call(messages, timeout=30):
-    response = _gpt_client.chat.completions.create(
-        model=GPT_MODEL, messages=messages, temperature=0,
-        timeout=timeout, max_tokens=2048,
-    )
-    return response.choices[0].message.content, response.usage.total_tokens
-
-
-def _gpt_call_with_retry(messages, timeout=30, retries=20):
-    for i in range(retries):
-        try:
-            return _gpt_call(messages, timeout)
-        except Exception as e:
-            time.sleep(20)
-            print(f"Retry {i} times, exception: {e} from message {messages}")
-    raise RuntimeError(f"Failed to get GPT-4 response after {retries} retries")
-
-
-def eval_answer(question, predict, ground_truth):
-    """Use GPT-4 as the verifier — returns True iff it judges ``predict`` correct."""
-    if predict == "":
-        return False
-    try:
-        messages = generate_messages([{
-            "type": "text",
-            "content": prompt_agent_verify_answer_referencing.format(
-                question=question,
-                ground_truth_answer=ground_truth,
-                agent_answer=predict,
-            ),
-        }])
-        response = _gpt_call_with_retry(messages)
-        result = response[0].lower()
-    except Exception as e:
-        print(f"Error verifying qa: {question} | {e}")
-        return False
-    return "yes" in result
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +215,38 @@ def _chain_key(v):
     return v.get("mem_path_audio") or v.get("mem_path")
 
 
+def _is_simlife_annotation(datas):
+    """Annotations are SimLife-shaped if any chain exposes the per-variant
+    pickle paths. Used to decide whether to inject SIMLIFE_CHARACTER_HINT
+    into the system prompt — keeping the original M3-Bench prompt
+    untouched on non-SimLife runs.
+    """
+    return any(
+        ("mem_path_audio" in v) or ("mem_path_noaudio" in v)
+        for v in datas.values()
+    )
+
+
 def _build_batches(datas, my_chain_keys, batch_size):
     """Flatten the chain-keyed annotation dict into per-batch lists of
-    per-question entries, honouring each question's ``variant`` label.
+    per-question entries.
+
+    Per-question routing:
+      - ``variant`` (``audio``|``noaudio``) decides which graph pickle to
+        load for retrieval. Set by the task's ``is_omni`` flag in
+        simlife_data_prep.
+      - ``hint``    (``no_hint``|``partial_hint``|``full_hint``) is
+        metadata only — control.py just passes it through to the output
+        so the downstream evaluator can slice accuracy by hint level.
+
+    Identifying fields (``task_id``, ``task_question_id``, ``question_type``,
+    ``options``) are also threaded through so the result JSONL is rich
+    enough for offline analysis without re-joining against the annotation
+    file.
     """
     batched, batch = [], []
     use_counts = {"audio": 0, "noaudio": 0}
+    hint_counts = {"no_hint": 0, "partial_hint": 0, "full_hint": 0, "?": 0}
     skipped_no_path = 0
     for v in datas.values():
         if _chain_key(v) not in my_chain_keys:
@@ -269,22 +264,27 @@ def _build_batches(datas, my_chain_keys, batch_size):
                 skipped_no_path += 1
                 continue
             use_counts[label] += 1
+            hint = qa.get("hint") or "?"
+            hint_counts[hint] = hint_counts.get(hint, 0) + 1
             entry = {
                 "id": qa["question_id"],
                 "variant": label,
+                "hint": hint,
                 "mem_path": mem_path,
                 "question": qa["question"],
                 "answer": qa["answer"],
             }
-            if "before_clip" in qa:
-                entry["before_clip"] = qa["before_clip"]
+            for k in ("options", "question_type", "format",
+                      "task_id", "task_question_id", "before_clip"):
+                if k in qa:
+                    entry[k] = qa[k]
             batch.append(entry)
             if len(batch) == batch_size:
                 batched.append(batch)
                 batch = []
     if batch:
         batched.append(batch)
-    return batched, use_counts, skipped_no_path
+    return batched, use_counts, hint_counts, skipped_no_path
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +322,11 @@ def _parse_args():
     parser.add_argument("--max_model_len", type=int, default=None,
                         help="Cap vLLM's context length. Lower this if KV cache "
                              "is pushing the OOM line.")
+    parser.add_argument("--is_simlife", type=bool, default=True,
+                        help="Whether the annotation file is a SimLife dataset. Keep ON for "
+                             "SimLife to inject the SIMLIFE_CHARACTER_HINT into the system "
+                             "prompt, which saves a search round per question by telling the "
+                             "model the fixed character-ID convention up-front.")
     return parser.parse_args()
 
 
@@ -362,33 +367,40 @@ def _build_llm(args):
 
 def _print_summary(args, output_path, results, batches, timing, total_elapsed,
                    max_num_seqs):
-    """Final per-shard summary: per-variant accuracy + per-stage timing."""
+    """Final per-shard summary: per-variant entry counts + per-stage timing.
+
+    No correctness scoring here — this driver only collects model answers;
+    grading is done downstream (see the combiner / external evaluator).
+    """
     by_variant = {}
+    by_hint = {}
     for r in results:
         v = r.get("variant", "?")
-        bucket = by_variant.setdefault(v, [0, 0])
-        bucket[0] += 1
-        if r.get("gpt_eval"):
-            bucket[1] += 1
+        by_variant[v] = by_variant.get(v, 0) + 1
+        h = r.get("hint", "?")
+        by_hint[h] = by_hint.get(h, 0) + 1
     n_total = len(results)
-    n_correct = sum(b[1] for b in by_variant.values())
     avg_active = (timing["active_seqs_sum"] / timing["rounds"]) if timing["rounds"] else 0.0
     pct = lambda part: (part / total_elapsed * 100) if total_elapsed else 0.0
+
+    # Stable display order for hint levels (no_hint < partial_hint < full_hint).
+    hint_order = ["no_hint", "partial_hint", "full_hint"]
+    hint_keys = [h for h in hint_order if h in by_hint] + [
+        h for h in sorted(by_hint) if h not in hint_order
+    ]
 
     print()
     print("=" * 60)
     print(f"shard {args.shard}/{args.num_shards}  done in {total_elapsed:.1f}s "
           f"({total_elapsed / 60:.1f} min) — wrote {output_path}")
-    print(f"  total entries: {n_total}    correct: {n_correct} "
-          f"({(n_correct / n_total * 100) if n_total else 0:.1f}%)")
+    print(f"  total entries: {n_total}")
     for v in sorted(by_variant):
-        t, c = by_variant[v]
-        pct_v = (c / t * 100) if t else 0
-        print(f"    variant={v:8s}  {t} entries  correct={c}  ({pct_v:.1f}%)")
+        print(f"    variant={v:8s}  {by_variant[v]} entries")
+    for h in hint_keys:
+        print(f"    hint={h:14s}  {by_hint[h]} entries")
     print(f"  batches:      {len(batches)}    rounds across batches: {timing['rounds']}")
     print(f"  vLLM gen:     {timing['gen']:.1f}s ({pct(timing['gen']):.1f}% wall)")
     print(f"  consumer:     {timing['consumer']:.1f}s ({pct(timing['consumer']):.1f}% wall)")
-    print(f"  eval (gpt-4): {timing['eval']:.1f}s ({pct(timing['eval']):.1f}% wall)")
     print(f"  avg active seqs/round: {avg_active:.1f} "
           f"(vs max_num_seqs={max_num_seqs}, "
           f"batch_size={processing_config['batch_size']})")
@@ -406,7 +418,7 @@ def _vllm_generate_round(model, batched_data, total_round, round_idx):
         if round_idx == total_round - 1:
             entry["conversations"][-1]["content"] += (
                 "\n(The Action of this round must be [Answer]. "
-                "If there is insufficient information, you can make reasonable guesses.)"
+                "If there is insufficient information, you can make reasonable guesses. The final answer should be an option for multi-choice questions.)"
             )
         text = tokenizer.apply_chat_template(
             entry["conversations"],
@@ -443,19 +455,24 @@ def main():
 
     # Annotation loading + sharding.
     datas = json.load(open(args.data_file))
+    is_simlife = args.is_simlife
+    system_prompt = SYSTEM_PROMPT + (SIMLIFE_CHARACTER_HINT if is_simlife else "")
     all_chain_keys = sorted({_chain_key(v) for v in datas.values() if _chain_key(v)})
     my_chain_keys = {p for i, p in enumerate(all_chain_keys)
                      if i % args.num_shards == args.shard}
     print(f"shard {args.shard}/{args.num_shards}: "
           f"{len(my_chain_keys)}/{len(all_chain_keys)} chains -> {output_path}")
+    if is_simlife:
+        print("simlife schema detected; injecting fixed character-id hint into the system prompt")
 
-    batches, use_counts, skipped = _build_batches(
+    batches, use_counts, hint_counts, skipped = _build_batches(
         datas, my_chain_keys, processing_config["batch_size"],
     )
     n_total_entries = sum(len(b) for b in batches)
+    hint_str = ", ".join(f"{k}={v}" for k, v in sorted(hint_counts.items()) if v)
     print(f"shard {args.shard}: {n_total_entries} entries in {len(batches)} batches "
-          f"(audio={use_counts['audio']}, noaudio={use_counts['noaudio']}"
-          f"{f', skipped_no_path={skipped}' if skipped else ''})")
+          f"(audio={use_counts['audio']}, noaudio={use_counts['noaudio']}; {hint_str}"
+          f"{f'; skipped_no_path={skipped}' if skipped else ''})")
 
     # Persistent worker pool: SLURM-aware sizing avoids spawning a worker
     # per physical core on a node where the job only has --cpus-per-task=K.
@@ -474,25 +491,23 @@ def main():
     timing = {
         "gen": 0.0,             # vLLM model.generate()
         "consumer": 0.0,        # parse + retrieve + truncate + refresh
-        "eval": 0.0,            # GPT-4 verifier round-trip
         "rounds": 0,            # round invocations across all batches
         "active_seqs_sum": 0,   # cumulative active sequences across rounds
         "questions_done": 0,
     }
 
     results = []
-    n_correct_so_far = 0
 
     pbar = tqdm(batches, desc="batches", unit="batch", dynamic_ncols=True)
     total_round = processing_config["total_round"]
     for batch_idx, batch in enumerate(pbar):
         batch_t0 = time.time()
-        batch_time = {"gen": 0.0, "consumer": 0.0, "eval": 0.0}
+        batch_time = {"gen": 0.0, "consumer": 0.0}
 
         for entry in batch:
             entry["conversations"] = [
                 {"role": "system",
-                 "content": SYSTEM_PROMPT.format(question=entry["question"])},
+                 "content": system_prompt.format(question=entry["question"])},
                 {"role": "user", "content": "Searched knowledge: {}"},
             ]
             entry["finish"] = False
@@ -521,22 +536,11 @@ def main():
                 refresh=False,
             )
 
-        # GPT-4 eval per question (rate-limited via the inner sleep).
-        eval_t0 = time.time()
+        # Collect raw answers for this batch; no online verifier.
         for entry in batch:
-            if "response" in entry:
-                entry["gpt_eval"] = eval_answer(
-                    entry["question"], entry["response"], entry["answer"],
-                )
-                time.sleep(0.5)
-            else:
-                entry["gpt_eval"] = False
+            if "response" not in entry:
+                entry["response"] = None
             results.append(entry)
-            if entry["gpt_eval"]:
-                n_correct_so_far += 1
-        eval_dt = time.time() - eval_t0
-        timing["eval"] += eval_dt
-        batch_time["eval"] += eval_dt
         timing["questions_done"] += len(batch)
 
         batch_dt = time.time() - batch_t0
@@ -545,9 +549,8 @@ def main():
             batch=f"{batch_dt:.1f}s",
             gen=f"{batch_time['gen']:.1f}s",
             cons=f"{batch_time['consumer']:.1f}s",
-            eval=f"{batch_time['eval']:.1f}s",
             avg_batch=f"{avg_per_batch:.1f}s",
-            acc=f"{n_correct_so_far}/{timing['questions_done']}",
+            done=f"{timing['questions_done']}",
         )
 
     pool.close()

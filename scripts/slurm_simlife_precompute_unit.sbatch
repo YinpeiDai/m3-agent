@@ -4,16 +4,17 @@
 #SBATCH --partition=spgpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --array=3-5%12
+#SBATCH --array=0-465%12
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=40G
-#SBATCH --time=03:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=m3_agent_outputs/simlife_logs/precompute_%A_%a.log
 
 
 # Stage A: per-video-unit precomputation (clips + faces + voices + memories).
-# Array length must match `wc -l data/simlife/units.txt` (default 0-319).
+# Array length must match `wc -l data/simlife/units.txt` (currently 466
+# units, so 0-465).
 
 source /home/daiyp/.bashrc
 cd /home/daiyp/m3-agent
