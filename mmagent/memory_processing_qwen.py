@@ -223,10 +223,12 @@ def process_memories(video_graph, memory_contents, clip_id, type='episodic',
 
     ``embeddings``: optional list of per-text embeddings aligned with
     ``memory_contents``. When provided we skip the
-    ``text-embedding-3-large`` API call entirely — Stage A4 caches
-    embeddings alongside the memory JSON, so chain assembly doesn't have
-    to re-fetch ~14k embeddings per chain on every rebuild. When ``None``
-    or wrong length we fall back to the original online behaviour.
+    ``text-embedding-3-large`` API call entirely. The SimLife adapter no
+    longer caches embeddings (Stage B prepends a date prefix that forces
+    a re-embed anyway), so this path stays as opt-in for legacy callers
+    that have pre-computed embeddings on the exact text being inserted.
+    When ``None`` or wrong length we fetch online from
+    ``text-embedding-3-large``.
     """
     def get_memory_embeddings(memory_contents):
         # calculate the embedding for each memory
