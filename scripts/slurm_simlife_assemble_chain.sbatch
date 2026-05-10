@@ -1,14 +1,19 @@
 #!/bin/bash
 #SBATCH --job-name=sl-asm
-#SBATCH --array=0-49%32
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
-#SBATCH --time=02:00:00
+#SBATCH --array=0-119%32
+#SBATCH --account=chaijy0
+#SBATCH --partition=standard
+#SBATCH --cpus-per-task=2
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --mem=10G
+#SBATCH --time=04:00:00
 #SBATCH --output=m3_agent_outputs/simlife_logs/assemble_%A_%a.log
 
-# Stage B: per-video-chain graph assembly. CPU-only; uses text-embedding-3-large API.
+# Stage B: per-video-chain graph assembly. CPU-only; uses text-embedding-3-large API
+# (re-embeds calendar-prefixed memory text per chain).
 # One job per unique video_chain_id. Array length must match
-# `wc -l data/simlife/data_chains.jsonl` (default 0-49 for the current 50 chains).
+# `wc -l data/simlife/data_chains.jsonl` (currently 120 chains, so 0-119).
 
 source /home/daiyp/.bashrc
 cd /home/daiyp/m3-agent
@@ -25,8 +30,8 @@ if [[ -z "$CHAIN" ]]; then
 fi
 
 echo "[$(date)] task=$SLURM_ARRAY_TASK_ID chain=$CHAIN host=$(hostname)"
-# Build both memory-graph variants by default (audio + vision). Override with
-# VARIANT=audio or VARIANT=vision before sbatch to build only one.
+# Build both memory-graph variants by default (audio + noaudio). Override with
+# VARIANT=audio or VARIANT=noaudio before sbatch to build only one.
 VARIANT="${VARIANT:-both}"
 python m3_agent/simlife_assemble_chain.py --chain "$CHAIN" --variant "$VARIANT"
 echo "[$(date)] done $CHAIN ($VARIANT)"

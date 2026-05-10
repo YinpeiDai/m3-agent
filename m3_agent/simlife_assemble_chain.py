@@ -409,19 +409,21 @@ def assemble(chain_row, memory_config, inter_root="data/intermediate", variant="
                     )
 
             # Memory — rewrite ids, then process via existing pipeline.
-            # Cached embeddings (saved at Stage A4) are passed through so
-            # process_memories doesn't have to re-fetch from the
-            # text-embedding-3-large API on every chain rebuild.
+            # Embeddings are computed here (calendar prefix forces a
+            # re-embed regardless of any Stage A cache).
             if not os.path.exists(mem_path):
                 pbar.update(1)
                 continue
             mem = json.load(open(mem_path))
             episodic_raw = mem.get("episodic", []) or []
             semantic_raw = mem.get("semantic", []) or []
-            # When we have a calendar prefix, the cached embeddings (computed
-            # on date-less Stage A text) no longer match the rewritten
-            # text; drop them so process_memories re-embeds against the
-            # date-prefixed line. Without a prefix, keep the cache.
+            # Stage A no longer caches embeddings (the calendar prefix
+            # injection here always forces a re-embed, so the cache was
+            # dead weight). For legacy units that still carry
+            # episodic_embeddings/semantic_embeddings keys we keep the
+            # opt-in read path: pass them through only when there's no
+            # calendar prefix to apply. With a prefix, embeddings come
+            # from process_memories' online fetch on the prefixed text.
             cached_epi = None if cal_prefix else mem.get("episodic_embeddings")
             cached_sem = None if cal_prefix else mem.get("semantic_embeddings")
             episodic, epi_embs = _filter_and_rewrite(

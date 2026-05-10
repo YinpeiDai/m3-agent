@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=5
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --mem=48G
-#SBATCH --time=03:00:00
+#SBATCH --mem=40G
+#SBATCH --time=04:00:00
 #SBATCH --output=m3_agent_outputs/simlife_logs/apply_overrides_%A_%a.log
 
 # Stage A.5: apply per-chain dialogue overrides on top of the default per-unit

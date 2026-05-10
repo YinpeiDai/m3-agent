@@ -238,7 +238,6 @@ def _regenerate_memories(chain_id, unit_id, affected_clips, out_dir,
     """
     from m3_agent.simlife_precompute_unit import (
         _generate_memory_for_clip, _force_correct_equivalences,
-        _embed_memory_texts,
     )
 
     unit_inter = os.path.join(inter_root, unit_id)
@@ -272,19 +271,11 @@ def _regenerate_memories(chain_id, unit_id, affected_clips, out_dir,
             epi, sem = [], []
         sem = _force_correct_equivalences(sem, voices)
 
-        try:
-            epi_emb = _embed_memory_texts(epi)
-            sem_emb = _embed_memory_texts(sem)
-        except Exception as e:
-            logger.warning("[%s/%s] embedding failed for clip %d: %s",
-                           chain_id, unit_id, k, e)
-            epi_emb, sem_emb = [], []
-
+        # Skip the text-embedding-3-large call: Stage B re-embeds every
+        # memory line with the chain's [YYYY-MM-DD, DayOfWeek] prefix
+        # prepended, so embeddings cached on date-less text would be
+        # discarded anyway. Matches the cleanup in simlife_precompute_unit.
         payload = {"episodic": epi, "semantic": sem}
-        if epi_emb and len(epi_emb) == len(epi):
-            payload["episodic_embeddings"] = epi_emb
-        if sem_emb and len(sem_emb) == len(sem):
-            payload["semantic_embeddings"] = sem_emb
         with open(out_path, "w") as f:
             json.dump(payload, f)
         regenerated.append(k)
