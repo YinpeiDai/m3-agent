@@ -4,7 +4,7 @@
 #SBATCH --partition=spgpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --array=109-465%12
+#SBATCH --array=0-465%12
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=40G
