@@ -4,11 +4,11 @@
 #SBATCH --partition=spgpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --array=0-465%12
+#SBATCH --array=109-465%12
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=40G
-#SBATCH --time=04:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=m3_agent_outputs/simlife_logs/precompute_%A_%a.log
 
 
