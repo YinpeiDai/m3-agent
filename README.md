@@ -191,6 +191,15 @@ diarization is not used; speaker embeddings are still computed from
 `dialogue_audio/session_*.wav`. Question prompts use the `*_vision` fields
 since M3-Agent is a VLM.
 
+Intall the env using `env.yaml`, you may need to install flash_attn seperately with 
+`pip install flash-attn==2.6.3 --no-build-isolation`
+
+Download ckpt and data, cd to this repo, then:
+1. Download simlif data to `SimLife-Data-HF` dir.
+2. Put [M3-Agent-Control](https://huggingface.co/ByteDance-Seed/M3-Agent-Control), 
+   [M3-Agent-Memorization](https://huggingface.co/ByteDance-Seed/M3-Agent-Memorization) and 
+   [pretrained_eres2netv2.ckpt](https://www.modelscope.cn/models/iic/speech_eres2netv2_sv_zh-cn_16k-common/resolve/master/pretrained_eres2netv2.ckpt) to the `models/` dir.
+
 ```bash
 # 1) Build manifests (units.txt, data_units.jsonl, data_chains.jsonl, simlife.json)
 python m3_agent/simlife_data_prep.py
